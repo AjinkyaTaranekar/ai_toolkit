@@ -191,22 +191,17 @@ extern "C"
 
     /**
      * Tool function: List all databases in the PostgreSQL instance
+     * Note: Assumes SPI is already connected by the caller
      */
     nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         try
         {
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-
             const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
             int ret = SPI_execute(sql, true, 0);
 
             if (ret != SPI_OK_SELECT)
             {
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
             }
 
@@ -225,7 +220,6 @@ extern "C"
                 }
             }
 
-            SPI_finish();
             return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
         }
         catch (const std::exception &e)
@@ -236,6 +230,7 @@ extern "C"
 
     /**
      * Tool function: List all tables in a specific database
+     * Note: Assumes SPI is already connected by the caller
      */
     nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
@@ -248,12 +243,7 @@ extern "C"
 
             std::string database = params["database"].get<std::string>();
 
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-
-            // Query to get all tables in the specified database
+            // Query to get all tables in the current database
             std::string sql = "SELECT schemaname, tablename FROM pg_tables "
                               "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
                               "ORDER BY schemaname, tablename";
@@ -262,7 +252,6 @@ extern "C"
 
             if (ret != SPI_OK_SELECT)
             {
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
             }
 
@@ -284,7 +273,6 @@ extern "C"
                 }
             }
 
-            SPI_finish();
             return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
         }
         catch (const std::exception &e)
@@ -316,11 +304,6 @@ extern "C"
                 table_name = table_name.substr(dot_pos + 1);
             }
 
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-
             // Get table columns
             std::string columns_sql =
                 "SELECT column_name, data_type, character_maximum_length, "
@@ -339,7 +322,6 @@ extern "C"
 
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
             {
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
             }
 
@@ -399,8 +381,6 @@ extern "C"
             }
 
             create_sql << "\n);";
-
-            SPI_finish();
 
             return nlohmann::json{
                 {"success", true},
@@ -535,99 +515,6 @@ extern "C"
     }
 
     /**
-     * Helper function to get database schema information
-     */
-    std::string get_schema_context()
-    {
-        std::stringstream schema_info;
-
-        if (SPI_connect() != SPI_OK_CONNECT)
-        {
-            return "Error: Could not retrieve schema information";
-        }
-
-        // Query to get all tables in the current database (excluding system schemas)
-        const char *tables_sql =
-            "SELECT schemaname, tablename, "
-            "       obj_description((schemaname||'.'||tablename)::regclass, 'pg_class') as description "
-            "FROM pg_tables "
-            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
-            "ORDER BY schemaname, tablename";
-
-        int ret = SPI_execute(tables_sql, true, 0);
-
-        if (ret == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            schema_info << "=== DATABASE SCHEMA ===\n\n";
-
-            for (uint64 i = 0; i < SPI_processed; i++)
-            {
-                bool isnull;
-                HeapTuple tuple = SPI_tuptable->vals[i];
-                TupleDesc tupdesc = SPI_tuptable->tupdesc;
-
-                Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-                Datum table_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
-                Datum desc_datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
-
-                std::string schema_name = TextDatumGetCString(schema_datum);
-                std::string table_name = TextDatumGetCString(table_datum);
-                std::string description = isnull ? "" : TextDatumGetCString(desc_datum);
-
-                schema_info << "Table: " << schema_name << "." << table_name;
-                if (!description.empty())
-                {
-                    schema_info << " - " << description;
-                }
-                schema_info << "\n";
-
-                // Get columns for this table
-                std::string columns_sql =
-                    "SELECT column_name, data_type, is_nullable, column_default "
-                    "FROM information_schema.columns "
-                    "WHERE table_schema = '" +
-                    schema_name + "' AND table_name = '" + table_name + "' "
-                                                                        "ORDER BY ordinal_position";
-
-                int col_ret = SPI_execute(columns_sql.c_str(), true, 0);
-
-                if (col_ret == SPI_OK_SELECT && SPI_processed > 0)
-                {
-                    for (uint64 j = 0; j < SPI_processed; j++)
-                    {
-                        HeapTuple col_tuple = SPI_tuptable->vals[j];
-                        TupleDesc col_tupdesc = SPI_tuptable->tupdesc;
-
-                        Datum col_name_datum = SPI_getbinval(col_tuple, col_tupdesc, 1, &isnull);
-                        Datum col_type_datum = SPI_getbinval(col_tuple, col_tupdesc, 2, &isnull);
-                        Datum col_nullable_datum = SPI_getbinval(col_tuple, col_tupdesc, 3, &isnull);
-
-                        std::string col_name = TextDatumGetCString(col_name_datum);
-                        std::string col_type = TextDatumGetCString(col_type_datum);
-                        std::string col_nullable = TextDatumGetCString(col_nullable_datum);
-
-                        schema_info << "  - " << col_name << " (" << col_type << ")";
-                        if (col_nullable == "NO")
-                        {
-                            schema_info << " NOT NULL";
-                        }
-                        schema_info << "\n";
-                    }
-                }
-
-                schema_info << "\n";
-            }
-        }
-        else
-        {
-            schema_info << "No user tables found in database.\n";
-        }
-
-        SPI_finish();
-        return schema_info.str();
-    }
-
-    /**
      * Query function - main AI-powered natural language query
      */
     Datum query(PG_FUNCTION_ARGS)
@@ -647,6 +534,14 @@ extern "C"
             std::string api_key(openrouter_api_key);
             std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
             std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
+
+            // Connect to SPI for tool functions to use
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                         errmsg("Failed to connect to SPI")));
+            }
 
             // Create AI client
             auto client = ai::openai::create_client(api_key, base_url);
@@ -916,13 +811,7 @@ extern "C"
                     // Execute the SQL query
                     elog(NOTICE, "\n📋 Generated Query:\n%s\n", sql_query.c_str());
 
-                    if (SPI_connect() != SPI_OK_CONNECT)
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                                 errmsg("Failed to connect to SPI for query execution")));
-                    }
-
+                    // SPI is already connected from the beginning of the function
                     int ret = SPI_execute(sql_query.c_str(), true, 0);
 
                     if (ret < 0)
@@ -992,6 +881,7 @@ extern "C"
                 }
                 else
                 {
+                    SPI_finish();
                     ereport(ERROR,
                             (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                              errmsg("No SQL query found in response. Expected format: ```sql <query> ```")));
@@ -1005,6 +895,7 @@ extern "C"
                     error_msg += " | " + result.error.value();
                 }
 
+                SPI_finish();
                 ereport(ERROR,
                         (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                          errmsg("%s", error_msg.c_str())));
@@ -1012,6 +903,7 @@ extern "C"
         }
         catch (const std::exception &e)
         {
+            SPI_finish();
             ereport(ERROR,
                     (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                      errmsg("Exception in query: %s", e.what())));
