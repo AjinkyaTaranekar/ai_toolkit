@@ -695,17 +695,23 @@ extern "C"
                 "- ONLY SELECT queries are allowed\n"
                 "- NEVER generate DROP, DELETE, UPDATE, or INSERT queries\n"
                 "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
-                "=== STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
-                "Follow these steps systematically:\n\n"
-                "1. CHECK CONTEXT FROM USER REQUEST\n"
-                "   - Review what information the user has provided\n"
-                "   - Identify any table names, column names, or conditions mentioned\n"
-                "   - Check memory for any relevant stored information using get_memory\n\n"
-                "2. EXPLORE DATABASES AND TABLES\n"
-                "   - If database context is unclear, use list_databases to see available databases\n"
-                "   - If table names are unclear, use list_tables_in_database to explore tables\n"
-                "   - Use get_schema_for_table to understand table structure for relevant tables\n\n"
-                "3. REVIEW SPECIAL CONDITIONS AND POINTS TO REMEMBER\n"
+                "=== MANDATORY STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
+                "You MUST follow these steps in order. DO NOT skip any steps or make assumptions:\n\n"
+                "1. MANDATORY: EXPLORE DATABASES FIRST\n"
+                "   - ALWAYS start by calling list_databases() to see all available databases\n"
+                "   - This is REQUIRED - do not skip this step\n"
+                "   - DO NOT assume you know what databases exist\n\n"
+                "2. MANDATORY: EXPLORE TABLES IN CURRENT DATABASE\n"
+                "   - ALWAYS call list_tables_in_database() to see all available tables\n"
+                "   - This is REQUIRED - do not skip this step\n"
+                "   - DO NOT assume you know what tables exist\n"
+                "   - DO NOT hallucinate table names\n\n"
+                "3. MANDATORY: GET TABLE SCHEMAS\n"
+                "   - ALWAYS call get_schema_for_table() for ALL tables that might be relevant to the query\n"
+                "   - This is REQUIRED - do not skip this step\n"
+                "   - DO NOT assume column names or data types\n"
+                "   - DO NOT hallucinate column names\n\n"
+                "4. CHECK MEMORY FOR ADDITIONAL CONTEXT\n"
                 "   - Use get_memory to check for:\n"
                 "     * get_memory('table', 'table_name') - table descriptions and usage notes\n"
                 "     * get_memory('column', 'table.column') - column details and meanings\n"
@@ -713,11 +719,13 @@ extern "C"
                 "     * get_memory('business_rule', 'rule_name') - business logic constraints\n"
                 "     * get_memory('data_pattern', 'pattern_name') - common data patterns\n"
                 "   - Consider any special filtering rules, calculated fields, or data quirks\n\n"
-                "4. GENERATE THE QUERY\n"
-                "   - Build the SELECT query based on all gathered information\n"
-                "   - Make reasonable assumptions based on standard SQL conventions\n"
-                "   - Use common sense for relationships (foreign key patterns, id matching)\n"
+                "5. GENERATE THE QUERY\n"
+                "   - Build the SELECT query based ONLY on the information gathered from tools\n"
+                "   - Use ONLY table names and columns that were returned by get_schema_for_table\n"
+                "   - DO NOT make assumptions or hallucinate schema information\n"
                 "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
+                "⚠️  CRITICAL: You MUST call list_databases, list_tables_in_database, and get_schema_for_table\n"
+                "    for EVERY query. Never skip these steps. Never assume schema information. Never hallucinate.\n\n"
                 "=== AVAILABLE TOOLS ===\n"
                 "Database exploration:\n"
                 "- list_databases() - List all databases in PostgreSQL instance\n"
@@ -742,7 +750,7 @@ extern "C"
             options.tools["list_databases"] = list_databases_tool;
             options.tools["list_tables_in_database"] = list_tables_tool;
             options.tools["get_schema_for_table"] = get_schema_tool;
-            options.max_steps = 10; // Allow multi-step reasoning with tool calls
+            options.max_steps = 20; // Allow multi-step reasoning with tool calls
 
             // Add callbacks for intermediate logging
             std::stringstream log_output;
@@ -753,7 +761,7 @@ extern "C"
                 if (!step.text.empty())
                 {
                     // Show a snippet of the thinking
-                    std::string snippet = step.text.length() > 50 ? step.text.substr(0, 50) + "..." : step.text;
+                    std::string snippet = step.text;
                     log_output << ": " << snippet;
                 }
                 log_output << "\n";
@@ -769,8 +777,7 @@ extern "C"
                 if (!call.id.empty())
                 {
                     // Show truncated ID
-                    std::string short_id = call.id.length() > 10 ? call.id.substr(0, 10) + "..." : call.id;
-                    log_output << " [" << short_id << "]";
+                    log_output << " [" << call.id << "]";
                 }
 
                 // Show arguments if they exist
