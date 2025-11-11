@@ -189,6 +189,231 @@ extern "C"
         }
     }
 
+    /**
+     * Tool function: List all databases in the PostgreSQL instance
+     */
+    nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
+    {
+        try
+        {
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
+            const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
+            int ret = SPI_execute(sql, true, 0);
+
+            if (ret != SPI_OK_SELECT)
+            {
+                SPI_finish();
+                return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
+            }
+
+            nlohmann::json databases = nlohmann::json::array();
+            for (uint64 i = 0; i < SPI_processed; i++)
+            {
+                bool isnull;
+                HeapTuple tuple = SPI_tuptable->vals[i];
+                TupleDesc tupdesc = SPI_tuptable->tupdesc;
+                Datum datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+
+                if (!isnull)
+                {
+                    std::string dbname = TextDatumGetCString(datum);
+                    databases.push_back(dbname);
+                }
+            }
+
+            SPI_finish();
+            return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
+        }
+        catch (const std::exception &e)
+        {
+            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+        }
+    }
+
+    /**
+     * Tool function: List all tables in a specific database
+     */
+    nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
+    {
+        try
+        {
+            if (!params.contains("database"))
+            {
+                return nlohmann::json{{"success", false}, {"error", "Missing required parameter: database"}};
+            }
+
+            std::string database = params["database"].get<std::string>();
+
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
+            // Query to get all tables in the specified database
+            std::string sql = "SELECT schemaname, tablename FROM pg_tables "
+                              "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                              "ORDER BY schemaname, tablename";
+
+            int ret = SPI_execute(sql.c_str(), true, 0);
+
+            if (ret != SPI_OK_SELECT)
+            {
+                SPI_finish();
+                return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
+            }
+
+            nlohmann::json tables = nlohmann::json::array();
+            for (uint64 i = 0; i < SPI_processed; i++)
+            {
+                bool isnull;
+                HeapTuple tuple = SPI_tuptable->vals[i];
+                TupleDesc tupdesc = SPI_tuptable->tupdesc;
+
+                Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+                Datum table_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+
+                if (!isnull)
+                {
+                    std::string schema_name = TextDatumGetCString(schema_datum);
+                    std::string table_name = TextDatumGetCString(table_datum);
+                    tables.push_back(schema_name + "." + table_name);
+                }
+            }
+
+            SPI_finish();
+            return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
+        }
+        catch (const std::exception &e)
+        {
+            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+        }
+    }
+
+    /**
+     * Tool function: Get the CREATE TABLE statement (schema) for a specific table
+     */
+    nlohmann::json tool_get_schema_for_table(const nlohmann::json &params, const ai::ToolExecutionContext &context)
+    {
+        try
+        {
+            if (!params.contains("table_name"))
+            {
+                return nlohmann::json{{"success", false}, {"error", "Missing required parameter: table_name"}};
+            }
+
+            std::string table_name = params["table_name"].get<std::string>();
+            std::string schema_name = "public";
+
+            // Parse schema.table if provided
+            size_t dot_pos = table_name.find('.');
+            if (dot_pos != std::string::npos)
+            {
+                schema_name = table_name.substr(0, dot_pos);
+                table_name = table_name.substr(dot_pos + 1);
+            }
+
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
+            // Get table columns
+            std::string columns_sql =
+                "SELECT column_name, data_type, character_maximum_length, "
+                "is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = $1 AND table_name = $2 "
+                "ORDER BY ordinal_position";
+
+            Datum values[2];
+            char nulls[2] = {' ', ' '};
+            values[0] = CStringGetTextDatum(schema_name.c_str());
+            values[1] = CStringGetTextDatum(table_name.c_str());
+            Oid argtypes[2] = {TEXTOID, TEXTOID};
+
+            int ret = SPI_execute_with_args(columns_sql.c_str(), 2, argtypes, values, nulls, true, 0);
+
+            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+            {
+                SPI_finish();
+                return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
+            }
+
+            // Build CREATE TABLE statement
+            std::stringstream create_sql;
+            create_sql << "CREATE TABLE " << schema_name << "." << table_name << " (\n";
+
+            nlohmann::json columns = nlohmann::json::array();
+            for (uint64 i = 0; i < SPI_processed; i++)
+            {
+                bool isnull;
+                HeapTuple tuple = SPI_tuptable->vals[i];
+                TupleDesc tupdesc = SPI_tuptable->tupdesc;
+
+                Datum col_name_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+                Datum col_type_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+                Datum col_maxlen_datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+                bool maxlen_isnull = isnull;
+                Datum col_nullable_datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+                Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+                bool default_isnull = isnull;
+
+                std::string col_name = TextDatumGetCString(col_name_datum);
+                std::string col_type = TextDatumGetCString(col_type_datum);
+                std::string col_nullable = TextDatumGetCString(col_nullable_datum);
+
+                nlohmann::json col_info;
+                col_info["name"] = col_name;
+                col_info["type"] = col_type;
+                col_info["nullable"] = (col_nullable == "YES");
+
+                create_sql << "  " << col_name << " " << col_type;
+
+                if (!maxlen_isnull && col_type == "character varying")
+                {
+                    int maxlen = DatumGetInt32(col_maxlen_datum);
+                    create_sql << "(" << maxlen << ")";
+                }
+
+                if (col_nullable == "NO")
+                {
+                    create_sql << " NOT NULL";
+                }
+
+                if (!default_isnull)
+                {
+                    std::string col_default = TextDatumGetCString(col_default_datum);
+                    create_sql << " DEFAULT " << col_default;
+                    col_info["default"] = col_default;
+                }
+
+                if (i < SPI_processed - 1)
+                {
+                    create_sql << ",\n";
+                }
+                columns.push_back(col_info);
+            }
+
+            create_sql << "\n);";
+
+            SPI_finish();
+
+            return nlohmann::json{
+                {"success", true},
+                {"table", schema_name + "." + table_name},
+                {"create_statement", create_sql.str()},
+                {"columns", columns}};
+        }
+        catch (const std::exception &e)
+        {
+            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+        }
+    }
+
     PG_FUNCTION_INFO_V1(help);
     PG_FUNCTION_INFO_V1(set_memory);
     PG_FUNCTION_INFO_V1(get_memory);
@@ -423,9 +648,6 @@ extern "C"
             std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
             std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
 
-            // Get database schema information
-            std::string schema_context = get_schema_context();
-
             // Create AI client
             auto client = ai::openai::create_client(api_key, base_url);
 
@@ -446,42 +668,219 @@ extern "C"
                 {{"category", "string"}, {"key", "string"}},
                 tool_get_memory);
 
-            // Build system prompt with schema context
+            // Define database exploration tools
+            ai::Tool list_databases_tool = ai::create_simple_tool(
+                "list_databases",
+                "List all available databases in the PostgreSQL instance. No parameters required.",
+                {},
+                tool_list_databases);
+
+            ai::Tool list_tables_tool = ai::create_simple_tool(
+                "list_tables_in_database",
+                "List all tables in a specific database. Parameters: database (name of the database)",
+                {{"database", "string"}},
+                tool_list_tables_in_database);
+
+            ai::Tool get_schema_tool = ai::create_simple_tool(
+                "get_schema_for_table",
+                "Get the CREATE TABLE statement (schema) for a specific table. "
+                "Parameters: table_name (name of table, optionally prefixed with schema like 'schema.table')",
+                {{"table_name", "string"}},
+                tool_get_schema_for_table);
+
+            // Build system prompt with step-by-step process
             std::string system_prompt =
                 "You are a PostgreSQL database assistant. Your role is to help users write SELECT queries.\n\n"
-                "=== AVAILABLE DATABASE SCHEMA ===\n" +
-                schema_context + "\n"
-                                 "=== STRICT QUERY RESTRICTIONS ===\n"
-                                 "- ONLY SELECT queries are allowed\n"
-                                 "- NEVER generate DROP, DELETE, UPDATE, or INSERT queries\n"
-                                 "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
-                                 "=== OPERATIONAL GUIDELINES ===\n"
-                                 "1. Check available context using get_memory tool for relevant tables/columns\n"
-                                 "2. If you have sufficient context from schema and memory to build a reasonable query, build it immediately - DO NOT ask questions\n"
-                                 "3. Only deny the request if the query is truly impossible without additional information\n"
-                                 "4. Make reasonable assumptions based on standard SQL conventions and available schema\n"
-                                 "5. Use common sense for relationships (e.g., foreign key patterns, id matching)\n"
-                                 "6. Use set_memory tool to save important context you learn for future queries\n\n"
-                                 "=== MEMORY TOOL USAGE ===\n"
-                                 "- Use get_memory('table', 'table_name') to get table descriptions\n"
-                                 "- Use get_memory('column', 'table.column') to get column details\n"
-                                 "- Use get_memory('relationship', 'table1_table2') to understand joins\n"
-                                 "- Use get_memory('business_rule', 'rule_name') for business logic\n"
-                                 "- Use set_memory when you discover patterns or relationships\n\n"
-                                 "=== RESPONSE FORMAT ===\n"
-                                 "If you can build the query:\n"
-                                 "1. SQL Query: [The SELECT query]\n"
-                                 "2. Explanation: [Brief explanation of what the query does]\n\n"
-                                 "If you cannot build the query:\n"
-                                 "1. Response: 'I cannot generate this query because [specific reason]. Please provide [specific information needed].'\n\n"
-                                 "Available memory categories: table, column, relationship, business_rule, data_pattern, "
-                                 "calculation, permission, custom";
+                "=== STRICT QUERY RESTRICTIONS ===\n"
+                "- ONLY SELECT queries are allowed\n"
+                "- NEVER generate DROP, DELETE, UPDATE, or INSERT queries\n"
+                "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
+                "=== STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
+                "Follow these steps systematically:\n\n"
+                "1. CHECK CONTEXT FROM USER REQUEST\n"
+                "   - Review what information the user has provided\n"
+                "   - Identify any table names, column names, or conditions mentioned\n"
+                "   - Check memory for any relevant stored information using get_memory\n\n"
+                "2. EXPLORE DATABASES AND TABLES\n"
+                "   - If database context is unclear, use list_databases to see available databases\n"
+                "   - If table names are unclear, use list_tables_in_database to explore tables\n"
+                "   - Use get_schema_for_table to understand table structure for relevant tables\n\n"
+                "3. REVIEW SPECIAL CONDITIONS AND POINTS TO REMEMBER\n"
+                "   - Use get_memory to check for:\n"
+                "     * get_memory('table', 'table_name') - table descriptions and usage notes\n"
+                "     * get_memory('column', 'table.column') - column details and meanings\n"
+                "     * get_memory('relationship', 'table1_table2') - join patterns\n"
+                "     * get_memory('business_rule', 'rule_name') - business logic constraints\n"
+                "     * get_memory('data_pattern', 'pattern_name') - common data patterns\n"
+                "   - Consider any special filtering rules, calculated fields, or data quirks\n\n"
+                "4. GENERATE THE QUERY\n"
+                "   - Build the SELECT query based on all gathered information\n"
+                "   - Make reasonable assumptions based on standard SQL conventions\n"
+                "   - Use common sense for relationships (foreign key patterns, id matching)\n"
+                "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
+                "5. RESPOND TO USER\n"
+                "   - If successful: Provide the SQL query with a brief explanation\n"
+                "   - If impossible: Explain what specific information is missing\n\n"
+                "=== AVAILABLE TOOLS ===\n"
+                "Database exploration:\n"
+                "- list_databases() - List all databases in PostgreSQL instance\n"
+                "- list_tables_in_database(database) - List all tables in a database\n"
+                "- get_schema_for_table(table_name) - Get CREATE TABLE statement for a table\n\n"
+                "Memory operations:\n"
+                "- get_memory(category, key) - Retrieve stored information\n"
+                "- set_memory(category, key, value, notes) - Store information for future use\n\n"
+                "Memory categories: table, column, relationship, business_rule, data_pattern, "
+                "calculation, permission, custom\n\n"
+                "=== RESPONSE FORMAT ===\n"
+                "SQL Query: [The SELECT query]\n"
+                "Explanation: [Brief explanation of what the query does and reasoning]\n";
 
             // Configure generation options with tools
             ai::GenerateOptions options(model, system_prompt, user_prompt);
             options.tools["set_memory"] = set_memory_tool;
             options.tools["get_memory"] = get_memory_tool;
-            options.max_steps = 5; // Allow multi-step reasoning with tool calls
+            options.tools["list_databases"] = list_databases_tool;
+            options.tools["list_tables_in_database"] = list_tables_tool;
+            options.tools["get_schema_for_table"] = get_schema_tool;
+            options.max_steps = 10; // Allow multi-step reasoning with tool calls
+
+            // Add callbacks for intermediate logging
+            std::stringstream log_output;
+
+            options.on_step_finish = [&log_output](const ai::GenerateStep &step)
+            {
+                log_output << "🧠 thinking";
+                if (!step.text.empty())
+                {
+                    // Show a snippet of the thinking
+                    std::string snippet = step.text.length() > 50 ? step.text.substr(0, 50) + "..." : step.text;
+                    log_output << ": " << snippet;
+                }
+                log_output << "\n";
+
+                if (!step.response_id.empty())
+                {
+                    log_output << "[INFO] Text generation successful - model: " << step.model_used
+                               << ", response_id: " << step.response_id << "\n";
+                }
+
+                elog(NOTICE, "%s", log_output.str().c_str());
+                log_output.str("");
+                log_output.clear();
+            };
+
+            options.on_tool_call_start = [&log_output](const ai::ToolCall &call)
+            {
+                log_output << "🔧 Calling: " << call.name;
+                if (!call.id.empty())
+                {
+                    // Show truncated ID
+                    std::string short_id = call.id.length() > 10 ? call.id.substr(0, 10) + "..." : call.id;
+                    log_output << " [" << short_id << "]";
+                }
+
+                // Show arguments if they exist
+                if (!call.arguments.empty() && !call.arguments.is_null())
+                {
+                    log_output << "\n  └─ Args: " << call.arguments.dump();
+                }
+                log_output << "\n";
+
+                elog(NOTICE, "%s", log_output.str().c_str());
+                log_output.str("");
+                log_output.clear();
+            };
+
+            options.on_tool_call_finish = [&log_output](const ai::ToolResult &result)
+            {
+                log_output << "✓ " << result.name << " completed\n";
+
+                // Show a summary of the result
+                if (!result.result.empty() && !result.result.is_null())
+                {
+                    if (result.result.contains("success") && result.result["success"] == true)
+                    {
+                        // Format based on tool type
+                        if (result.name == "list_databases" && result.result.contains("count"))
+                        {
+                            int count = result.result["count"];
+                            std::string preview;
+                            if (result.result.contains("databases") && result.result["databases"].is_array())
+                            {
+                                auto dbs = result.result["databases"];
+                                int show = std::min(5, (int)dbs.size());
+                                for (int i = 0; i < show; i++)
+                                {
+                                    if (i > 0)
+                                        preview += " - ";
+                                    preview += dbs[i].get<std::string>();
+                                }
+                                if (dbs.size() > 5)
+                                    preview += "...";
+                            }
+                            log_output << "  └─ Found " << count << " databases: " << preview << "\n";
+                        }
+                        else if (result.name == "list_tables_in_database" && result.result.contains("count"))
+                        {
+                            int count = result.result["count"];
+                            std::string db = result.result.value("database", "");
+                            std::string preview;
+                            if (result.result.contains("tables") && result.result["tables"].is_array())
+                            {
+                                auto tables = result.result["tables"];
+                                int show = std::min(5, (int)tables.size());
+                                for (int i = 0; i < show; i++)
+                                {
+                                    if (i > 0)
+                                        preview += " - ";
+                                    preview += tables[i].get<std::string>();
+                                }
+                                if (tables.size() > 5)
+                                    preview += "...";
+                            }
+                            log_output << "  └─ Found " << count << " tables in database '" << db << "': " << preview << "\n";
+                        }
+                        else if (result.name == "get_schema_for_table" && result.result.contains("table"))
+                        {
+                            std::string table = result.result["table"];
+                            int col_count = result.result.contains("columns") ? result.result["columns"].size() : 0;
+                            log_output << "  └─ Retrieved schema for '" << table << "' (" << col_count << " columns)\n";
+                        }
+                        else if (result.name == "set_memory")
+                        {
+                            std::string category = result.result.value("category", "");
+                            std::string key = result.result.value("key", "");
+                            log_output << "  └─ Saved memory: [" << category << "] " << key << "\n";
+                        }
+                        else if (result.name == "get_memory")
+                        {
+                            std::string category = result.result.value("category", "");
+                            std::string key = result.result.value("key", "");
+                            if (result.result.contains("value"))
+                            {
+                                log_output << "  └─ Retrieved memory: [" << category << "] " << key << "\n";
+                            }
+                            else
+                            {
+                                log_output << "  └─ No memory found: [" << category << "] " << key << "\n";
+                            }
+                        }
+                        else
+                        {
+                            log_output << "  └─ Success\n";
+                        }
+                    }
+                    else
+                    {
+                        std::string error = result.result.value("error", "Unknown error");
+                        log_output << "  └─ Error: " << error << "\n";
+                    }
+                }
+
+                elog(NOTICE, "%s", log_output.str().c_str());
+                log_output.str("");
+                log_output.clear();
+            };
 
             // Generate response
             auto result = client.generate_text(options);
