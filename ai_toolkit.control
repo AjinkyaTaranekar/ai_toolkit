@@ -1,5 +1,5 @@
-# pg_ai_toolkit.control
+# ai_toolkit.control
 comment = 'Extension to bring AI to Postgres'
 default_version = '1.0'
-module_pathname = '$libdir/pg_ai_toolkit'
+module_pathname = '$libdir/ai_toolkit'
 relocatable = false
