@@ -10,6 +10,6 @@ AI_SDK_JSON = $(AI_SDK_DIR)/third_party/nlohmann_json_patched/include
 
 # Compiler flags for C++
 PG_CPPFLAGS = -I$(AI_SDK_INCLUDE) -I$(AI_SDK_JSON) -std=c++20 -DAI_SDK_HAS_OPENAI -DAI_SDK_HAS_ANTHROPIC
-SHLIB_LINK = $(AI_SDK_BUILD)/libai-sdk-cpp-openai.a $(AI_SDK_BUILD)/libai-sdk-cpp-anthropic.a $(AI_SDK_BUILD)/libai-sdk-cpp-core.a -lstdc++ -lssl -lcrypto -lpthread -lcurl
+SHLIB_LINK = -Wl,--whole-archive $(AI_SDK_BUILD)/libai-sdk-cpp-openai.a $(AI_SDK_BUILD)/libai-sdk-cpp-anthropic.a $(AI_SDK_BUILD)/libai-sdk-cpp-core.a -Wl,--no-whole-archive -lstdc++ -lssl -lcrypto -lpthread -lcurl
 
 include $(PGXS)
