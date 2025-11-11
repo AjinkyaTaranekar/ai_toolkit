@@ -198,10 +198,16 @@ extern "C"
         {
             const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
 
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
             int ret = SPI_execute(sql, true, 0);
 
             if (ret != SPI_OK_SELECT)
             {
+                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
             }
 
@@ -224,14 +230,17 @@ extern "C"
                 }
             }
 
+            SPI_finish();
             return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
         }
         catch (const std::exception &e)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
@@ -250,6 +259,11 @@ extern "C"
 
             std::string database = params["database"].get<std::string>();
 
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
             // Query to get all tables in the current database
             std::string sql = "SELECT schemaname, tablename FROM pg_tables "
                               "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
@@ -259,6 +273,7 @@ extern "C"
 
             if (ret != SPI_OK_SELECT)
             {
+                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
             }
 
@@ -285,19 +300,24 @@ extern "C"
                 }
             }
 
+            SPI_finish();
             return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
         }
         catch (const std::exception &e)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
-    } /**
-       * Tool function: Get the CREATE TABLE statement (schema) for a specific table
-       */
+    }
+
+    /**
+     * Tool function: Get the CREATE TABLE statement (schema) for a specific table
+     */
     nlohmann::json tool_get_schema_for_table(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         try
@@ -318,6 +338,11 @@ extern "C"
                 table_name = table_name.substr(dot_pos + 1);
             }
 
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
+            }
+
             // Get table columns
             std::string columns_sql =
                 "SELECT column_name, data_type, character_maximum_length, "
@@ -336,6 +361,7 @@ extern "C"
 
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
             {
+                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
             }
 
@@ -408,6 +434,7 @@ extern "C"
 
             create_sql << "\n);";
 
+            SPI_finish();
             return nlohmann::json{
                 {"success", true},
                 {"table", schema_name + "." + table_name},
@@ -416,13 +443,16 @@ extern "C"
         }
         catch (const std::exception &e)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
+            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
+
     PG_FUNCTION_INFO_V1(help);
     PG_FUNCTION_INFO_V1(set_memory);
     PG_FUNCTION_INFO_V1(get_memory);
