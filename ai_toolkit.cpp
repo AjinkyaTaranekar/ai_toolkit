@@ -30,17 +30,18 @@ extern "C"
     /**
      * Core function to set memory in database
      * Returns: true on success, false on failure (sets error_msg if provided)
+     * manage_spi: if true, handles SPI_connect/finish; if false, uses existing connection
      */
     bool memory_set_core(const std::string &category, const std::string &key,
                          const std::string &value, const std::optional<std::string> &notes,
-                         std::string *error_msg = nullptr)
+                         std::string *error_msg = nullptr, bool manage_spi = true)
     {
         std::string sql = "INSERT INTO ai_toolkit.ai_memory (category, key, value, notes, updated_at) "
                           "VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) "
                           "ON CONFLICT (category, key) DO UPDATE SET "
                           "value = EXCLUDED.value, notes = EXCLUDED.notes, updated_at = CURRENT_TIMESTAMP";
 
-        if (SPI_connect() != SPI_OK_CONNECT)
+        if (manage_spi && SPI_connect() != SPI_OK_CONNECT)
         {
             if (error_msg)
                 *error_msg = "Failed to connect to SPI";
@@ -60,7 +61,8 @@ extern "C"
         int ret = SPI_execute_with_args(sql.c_str(), 4, argtypes,
                                         values, nulls, false, 0);
 
-        SPI_finish();
+        if (manage_spi)
+            SPI_finish();
 
         if (ret < 0)
         {
@@ -75,13 +77,14 @@ extern "C"
     /**
      * Core function to get memory from database
      * Returns: value if found, std::nullopt if not found
+     * manage_spi: if true, handles SPI_connect/finish; if false, uses existing connection
      */
     std::optional<std::string> memory_get_core(const std::string &category, const std::string &key,
-                                               std::string *error_msg = nullptr)
+                                               std::string *error_msg = nullptr, bool manage_spi = true)
     {
         std::string sql = "SELECT value FROM ai_toolkit.ai_memory WHERE category = $1 AND key = $2";
 
-        if (SPI_connect() != SPI_OK_CONNECT)
+        if (manage_spi && SPI_connect() != SPI_OK_CONNECT)
         {
             if (error_msg)
                 *error_msg = "Failed to connect to SPI";
@@ -107,12 +110,14 @@ extern "C"
             {
                 text *result_text = DatumGetTextPP(result_datum);
                 std::string result = std::string(VARDATA_ANY(result_text), VARSIZE_ANY_EXHDR(result_text));
-                SPI_finish();
+                if (manage_spi)
+                    SPI_finish();
                 return result;
             }
         }
 
-        SPI_finish();
+        if (manage_spi)
+            SPI_finish();
         return std::nullopt;
     }
 
@@ -139,7 +144,7 @@ extern "C"
             }
 
             std::string error_msg;
-            bool success = memory_set_core(category, key, value, notes, &error_msg);
+            bool success = memory_set_core(category, key, value, notes, &error_msg, false);
 
             if (success)
             {
@@ -172,7 +177,7 @@ extern "C"
             std::string key = params["key"].get<std::string>();
 
             std::string error_msg;
-            auto result = memory_get_core(category, key, &error_msg);
+            auto result = memory_get_core(category, key, &error_msg, false);
 
             if (result.has_value())
             {
@@ -197,23 +202,15 @@ extern "C"
         elog(LOG, "[tool_list_databases] Starting execution");
         try
         {
-            elog(LOG, "[tool_list_databases] About to call SPI_connect()");
             const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
 
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                elog(LOG, "[tool_list_databases] SPI_connect() failed");
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-
-            elog(LOG, "[tool_list_databases] SPI_connect() successful, about to execute query");
+            elog(LOG, "[tool_list_databases] About to execute query (using existing SPI connection)");
             int ret = SPI_execute(sql, true, 0);
             elog(LOG, "[tool_list_databases] SPI_execute() returned: %d", ret);
 
             if (ret != SPI_OK_SELECT)
             {
                 elog(LOG, "[tool_list_databases] Query execution failed");
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
             }
 
@@ -238,21 +235,17 @@ extern "C"
                 }
             }
 
-            elog(LOG, "[tool_list_databases] About to call SPI_finish()");
-            SPI_finish();
-            elog(LOG, "[tool_list_databases] SPI_finish() successful, returning result");
+            elog(LOG, "[tool_list_databases] Returning result");
             return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
         }
         catch (const std::exception &e)
         {
             elog(LOG, "[tool_list_databases] Caught std::exception: %s", e.what());
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
             elog(LOG, "[tool_list_databases] Caught unknown exception");
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
@@ -274,27 +267,18 @@ extern "C"
             std::string database = params["database"].get<std::string>();
             elog(LOG, "[tool_list_tables_in_database] Database parameter: %s", database.c_str());
 
-            elog(LOG, "[tool_list_tables_in_database] About to call SPI_connect()");
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                elog(LOG, "[tool_list_tables_in_database] SPI_connect() failed");
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-            elog(LOG, "[tool_list_tables_in_database] SPI_connect() successful");
-
             // Query to get all tables in the current database
             std::string sql = "SELECT schemaname, tablename FROM pg_tables "
                               "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
                               "ORDER BY schemaname, tablename";
 
-            elog(LOG, "[tool_list_tables_in_database] About to execute query");
+            elog(LOG, "[tool_list_tables_in_database] About to execute query (using existing SPI connection)");
             int ret = SPI_execute(sql.c_str(), true, 0);
             elog(LOG, "[tool_list_tables_in_database] SPI_execute() returned: %d", ret);
 
             if (ret != SPI_OK_SELECT)
             {
                 elog(LOG, "[tool_list_tables_in_database] Query execution failed");
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
             }
 
@@ -323,21 +307,17 @@ extern "C"
                 }
             }
 
-            elog(LOG, "[tool_list_tables_in_database] About to call SPI_finish()");
-            SPI_finish();
-            elog(LOG, "[tool_list_tables_in_database] SPI_finish() successful, returning result");
+            elog(LOG, "[tool_list_tables_in_database] Returning result");
             return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
         }
         catch (const std::exception &e)
         {
             elog(LOG, "[tool_list_tables_in_database] Caught std::exception: %s", e.what());
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
             elog(LOG, "[tool_list_tables_in_database] Caught unknown exception");
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
@@ -368,15 +348,6 @@ extern "C"
             }
 
             elog(LOG, "[tool_get_schema_for_table] Schema: %s, Table: %s", schema_name.c_str(), table_name.c_str());
-            elog(LOG, "[tool_get_schema_for_table] About to call SPI_connect()");
-
-            if (SPI_connect() != SPI_OK_CONNECT)
-            {
-                elog(LOG, "[tool_get_schema_for_table] SPI_connect() failed");
-                return nlohmann::json{{"success", false}, {"error", "Failed to connect to SPI"}};
-            }
-
-            elog(LOG, "[tool_get_schema_for_table] SPI_connect() successful");
 
             // Get table columns
             std::string columns_sql =
@@ -386,7 +357,7 @@ extern "C"
                 "WHERE table_schema = $1 AND table_name = $2 "
                 "ORDER BY ordinal_position";
 
-            elog(LOG, "[tool_get_schema_for_table] About to execute query with args");
+            elog(LOG, "[tool_get_schema_for_table] About to execute query with args (using existing SPI connection)");
             Datum values[2];
             char nulls[2] = {' ', ' '};
             values[0] = CStringGetTextDatum(schema_name.c_str());
@@ -399,7 +370,6 @@ extern "C"
             if (ret != SPI_OK_SELECT || SPI_processed == 0)
             {
                 elog(LOG, "[tool_get_schema_for_table] Table not found or query failed");
-                SPI_finish();
                 return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
             }
 
@@ -472,9 +442,7 @@ extern "C"
 
             create_sql << "\n);";
 
-            elog(LOG, "[tool_get_schema_for_table] Schema generation complete, about to call SPI_finish()");
-            SPI_finish();
-            elog(LOG, "[tool_get_schema_for_table] SPI_finish() successful, returning result");
+            elog(LOG, "[tool_get_schema_for_table] Schema generation complete, returning result");
             return nlohmann::json{
                 {"success", true},
                 {"table", schema_name + "." + table_name},
@@ -484,13 +452,11 @@ extern "C"
         catch (const std::exception &e)
         {
             elog(LOG, "[tool_get_schema_for_table] Caught std::exception: %s", e.what());
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
         catch (...)
         {
             elog(LOG, "[tool_get_schema_for_table] Caught unknown exception");
-            SPI_finish();
             return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
