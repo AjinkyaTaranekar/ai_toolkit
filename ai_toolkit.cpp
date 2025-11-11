@@ -191,13 +191,13 @@ extern "C"
 
     /**
      * Tool function: List all databases in the PostgreSQL instance
-     * Note: Assumes SPI is already connected by the caller
      */
     nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         try
         {
             const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
+
             int ret = SPI_execute(sql, true, 0);
 
             if (ret != SPI_OK_SELECT)
@@ -206,6 +206,7 @@ extern "C"
             }
 
             nlohmann::json databases = nlohmann::json::array();
+
             for (uint64 i = 0; i < SPI_processed; i++)
             {
                 bool isnull;
@@ -215,8 +216,11 @@ extern "C"
 
                 if (!isnull)
                 {
-                    std::string dbname = TextDatumGetCString(datum);
-                    databases.push_back(dbname);
+                    char *dbname_str = TextDatumGetCString(datum);
+                    if (dbname_str)
+                    {
+                        databases.push_back(std::string(dbname_str));
+                    }
                 }
             }
 
@@ -224,13 +228,16 @@ extern "C"
         }
         catch (const std::exception &e)
         {
-            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
+        }
+        catch (...)
+        {
+            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
 
     /**
      * Tool function: List all tables in a specific database
-     * Note: Assumes SPI is already connected by the caller
      */
     nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
@@ -256,6 +263,7 @@ extern "C"
             }
 
             nlohmann::json tables = nlohmann::json::array();
+
             for (uint64 i = 0; i < SPI_processed; i++)
             {
                 bool isnull;
@@ -267,9 +275,13 @@ extern "C"
 
                 if (!isnull)
                 {
-                    std::string schema_name = TextDatumGetCString(schema_datum);
-                    std::string table_name = TextDatumGetCString(table_datum);
-                    tables.push_back(schema_name + "." + table_name);
+                    char *schema_str = TextDatumGetCString(schema_datum);
+                    char *table_str = TextDatumGetCString(table_datum);
+                    if (schema_str && table_str)
+                    {
+                        std::string full_name = std::string(schema_str) + "." + std::string(table_str);
+                        tables.push_back(full_name);
+                    }
                 }
             }
 
@@ -277,13 +289,15 @@ extern "C"
         }
         catch (const std::exception &e)
         {
-            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
         }
-    }
-
-    /**
-     * Tool function: Get the CREATE TABLE statement (schema) for a specific table
-     */
+        catch (...)
+        {
+            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
+        }
+    } /**
+       * Tool function: Get the CREATE TABLE statement (schema) for a specific table
+       */
     nlohmann::json tool_get_schema_for_table(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         try
@@ -330,6 +344,7 @@ extern "C"
             create_sql << "CREATE TABLE " << schema_name << "." << table_name << " (\n";
 
             nlohmann::json columns = nlohmann::json::array();
+
             for (uint64 i = 0; i < SPI_processed; i++)
             {
                 bool isnull;
@@ -344,40 +359,51 @@ extern "C"
                 Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
                 bool default_isnull = isnull;
 
-                std::string col_name = TextDatumGetCString(col_name_datum);
-                std::string col_type = TextDatumGetCString(col_type_datum);
-                std::string col_nullable = TextDatumGetCString(col_nullable_datum);
+                char *col_name_str = TextDatumGetCString(col_name_datum);
+                char *col_type_str = TextDatumGetCString(col_type_datum);
+                char *col_nullable_str = TextDatumGetCString(col_nullable_datum);
 
-                nlohmann::json col_info;
-                col_info["name"] = col_name;
-                col_info["type"] = col_type;
-                col_info["nullable"] = (col_nullable == "YES");
-
-                create_sql << "  " << col_name << " " << col_type;
-
-                if (!maxlen_isnull && col_type == "character varying")
+                if (col_name_str && col_type_str && col_nullable_str)
                 {
-                    int maxlen = DatumGetInt32(col_maxlen_datum);
-                    create_sql << "(" << maxlen << ")";
-                }
+                    std::string col_name(col_name_str);
+                    std::string col_type(col_type_str);
+                    std::string col_nullable(col_nullable_str);
 
-                if (col_nullable == "NO")
-                {
-                    create_sql << " NOT NULL";
-                }
+                    nlohmann::json col_info;
+                    col_info["name"] = col_name;
+                    col_info["type"] = col_type;
+                    col_info["nullable"] = (col_nullable == "YES");
 
-                if (!default_isnull)
-                {
-                    std::string col_default = TextDatumGetCString(col_default_datum);
-                    create_sql << " DEFAULT " << col_default;
-                    col_info["default"] = col_default;
-                }
+                    create_sql << "  " << col_name << " " << col_type;
 
-                if (i < SPI_processed - 1)
-                {
-                    create_sql << ",\n";
+                    if (!maxlen_isnull && col_type == "character varying")
+                    {
+                        int maxlen = DatumGetInt32(col_maxlen_datum);
+                        create_sql << "(" << maxlen << ")";
+                    }
+
+                    if (col_nullable == "NO")
+                    {
+                        create_sql << " NOT NULL";
+                    }
+
+                    if (!default_isnull)
+                    {
+                        char *col_default_str = TextDatumGetCString(col_default_datum);
+                        if (col_default_str)
+                        {
+                            std::string col_default(col_default_str);
+                            create_sql << " DEFAULT " << col_default;
+                            col_info["default"] = col_default;
+                        }
+                    }
+
+                    if (i < SPI_processed - 1)
+                    {
+                        create_sql << ",\n";
+                    }
+                    columns.push_back(col_info);
                 }
-                columns.push_back(col_info);
             }
 
             create_sql << "\n);";
@@ -390,10 +416,13 @@ extern "C"
         }
         catch (const std::exception &e)
         {
-            return nlohmann::json{{"success", false}, {"error", std::string(e.what())}};
+            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
+        }
+        catch (...)
+        {
+            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
         }
     }
-
     PG_FUNCTION_INFO_V1(help);
     PG_FUNCTION_INFO_V1(set_memory);
     PG_FUNCTION_INFO_V1(get_memory);
