@@ -718,9 +718,6 @@ extern "C"
                 "   - Make reasonable assumptions based on standard SQL conventions\n"
                 "   - Use common sense for relationships (foreign key patterns, id matching)\n"
                 "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
-                "5. RESPOND TO USER\n"
-                "   - If successful: Provide the SQL query with a brief explanation\n"
-                "   - If impossible: Explain what specific information is missing\n\n"
                 "=== AVAILABLE TOOLS ===\n"
                 "Database exploration:\n"
                 "- list_databases() - List all databases in PostgreSQL instance\n"
@@ -732,8 +729,11 @@ extern "C"
                 "Memory categories: table, column, relationship, business_rule, data_pattern, "
                 "calculation, permission, custom\n\n"
                 "=== RESPONSE FORMAT ===\n"
-                "SQL Query: [The SELECT query]\n"
-                "Explanation: [Brief explanation of what the query does and reasoning]\n";
+                "Generate your SQL query ONLY in this exact format:\n"
+                "```sql\n"
+                "<your SELECT query here>\n"
+                "```\n"
+                "No other text or explanation is needed.\n";
 
             // Configure generation options with tools
             ai::GenerateOptions options(model, system_prompt, user_prompt);
@@ -881,16 +881,114 @@ extern "C"
 
             if (result)
             {
-                // Format response with tool usage information
-                std::stringstream response;
-                response << result.text;
+                // Parse SQL query from response
+                std::string response_text = result.text;
+                std::string sql_query;
 
-                if (result.has_tool_calls())
+                // Look for ```sql ... ``` pattern
+                size_t sql_start = response_text.find("```sql");
+                if (sql_start != std::string::npos)
                 {
-                    response << "\n\n[Tool Calls Made: " << result.tool_calls.size() << "]";
+                    sql_start += 6; // Move past "```sql"
+                    size_t sql_end = response_text.find("```", sql_start);
+                    if (sql_end != std::string::npos)
+                    {
+                        sql_query = response_text.substr(sql_start, sql_end - sql_start);
+                        // Trim whitespace
+                        size_t first = sql_query.find_first_not_of(" \n\r\t");
+                        size_t last = sql_query.find_last_not_of(" \n\r\t");
+                        if (first != std::string::npos && last != std::string::npos)
+                        {
+                            sql_query = sql_query.substr(first, last - first + 1);
+                        }
+                    }
                 }
 
-                PG_RETURN_TEXT_P(cstring_to_text(response.str().c_str()));
+                if (!sql_query.empty())
+                {
+                    // Execute the SQL query
+                    elog(NOTICE, "\n📋 Generated Query:\n%s\n", sql_query.c_str());
+
+                    if (SPI_connect() != SPI_OK_CONNECT)
+                    {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                                 errmsg("Failed to connect to SPI for query execution")));
+                    }
+
+                    int ret = SPI_execute(sql_query.c_str(), true, 0);
+
+                    if (ret < 0)
+                    {
+                        SPI_finish();
+                        ereport(ERROR,
+                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                                 errmsg("Query execution failed")));
+                    }
+
+                    // Print results as a table
+                    if (SPI_processed > 0)
+                    {
+                        std::stringstream table_output;
+                        table_output << "\n📊 Query Results (" << SPI_processed << " rows):\n";
+                        table_output << "═══════════════════════════════════════════════════════════\n";
+
+                        SPITupleTable *tuptable = SPI_tuptable;
+                        TupleDesc tupdesc = tuptable->tupdesc;
+
+                        // Print column headers
+                        for (int i = 0; i < tupdesc->natts; i++)
+                        {
+                            if (i > 0)
+                                table_output << " | ";
+                            table_output << SPI_fname(tupdesc, i + 1);
+                        }
+                        table_output << "\n";
+                        table_output << "───────────────────────────────────────────────────────────\n";
+
+                        // Print rows
+                        for (uint64 row = 0; row < SPI_processed; row++)
+                        {
+                            HeapTuple tuple = tuptable->vals[row];
+                            for (int col = 1; col <= tupdesc->natts; col++)
+                            {
+                                if (col > 1)
+                                    table_output << " | ";
+
+                                bool isnull;
+                                Datum datum = SPI_getbinval(tuple, tupdesc, col, &isnull);
+
+                                if (isnull)
+                                {
+                                    table_output << "NULL";
+                                }
+                                else
+                                {
+                                    char *value = SPI_getvalue(tuple, tupdesc, col);
+                                    table_output << value;
+                                    pfree(value);
+                                }
+                            }
+                            table_output << "\n";
+                        }
+
+                        table_output << "═══════════════════════════════════════════════════════════\n";
+                        elog(NOTICE, "%s", table_output.str().c_str());
+                    }
+                    else
+                    {
+                        elog(NOTICE, "\n✓ Query executed successfully. No rows returned.\n");
+                    }
+
+                    SPI_finish();
+                    PG_RETURN_VOID();
+                }
+                else
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("No SQL query found in response. Expected format: ```sql <query> ```")));
+                }
             }
             else
             {

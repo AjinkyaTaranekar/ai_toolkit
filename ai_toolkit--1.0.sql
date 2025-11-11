@@ -64,7 +64,7 @@ LANGUAGE C STRICT;
 
 -- Query function - main AI-powered natural language query generator
 CREATE OR REPLACE FUNCTION ai_toolkit.query(text)
-RETURNS text AS 'ai_toolkit', 'query'
+RETURNS void AS 'ai_toolkit', 'query'
 LANGUAGE C STRICT;
 
 -- ==========================================
