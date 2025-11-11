@@ -1,4 +1,6 @@
 MODULES = ai_toolkit
+EXTENSION = ai_toolkit
+DATA = ai_toolkit--1.0.sql
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
