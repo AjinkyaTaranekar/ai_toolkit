@@ -57,9 +57,20 @@ extern "C"
                          errmsg("ai_toolkit.openrouter_api_key not set")));
             }
             std::string api_key(openrouter_api_key);
+            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
+            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
+
+            // Log configuration for debugging
+            ereport(NOTICE,
+                    (errmsg("Calling OpenRouter - Base URL: %s, Model: %s, API Key length: %zu",
+                            base_url.c_str(), model.c_str(), api_key.length())));
+
+            // Enable debug logging to see HTTP errors
+            ai::logger::install_logger(std::make_shared<ai::logger::ConsoleLogger>(
+                ai::logger::LogLevel::kLogLevelDebug));
 
             // Create OpenAI client with OpenRouter's base URL
-            auto client = ai::openai::create_client(api_key, openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api/v1");
+            auto client = ai::openai::create_client(api_key, base_url);
 
             // Create a personalized greeting prompt
             std::string prompt = "Generate a warm, friendly greeting for someone named " +
@@ -67,10 +78,7 @@ extern "C"
                                  ". Keep it brief and welcoming (1-2 sentences).";
 
             // Generate greeting using OpenRouter
-            ai::GenerateOptions options(
-                openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free",
-                "You are a friendly assistant that creates personalized greetings.",
-                prompt);
+            ai::GenerateOptions options(model, "You are a friendly assistant that creates personalized greetings.", prompt);
 
             auto result = client.generate_text(options);
 
@@ -83,9 +91,43 @@ extern "C"
             }
             else
             {
+                // Build detailed error message
+                std::string error_msg = "OpenRouter API error: " + result.error_message();
+
+                // Add all available error details
+                if (result.error.has_value())
+                {
+                    error_msg += " | Error detail: " + result.error.value();
+                }
+
+                // Add warnings if any
+                if (!result.warnings.empty())
+                {
+                    error_msg += " | Warnings: ";
+                    for (const auto &warning : result.warnings)
+                    {
+                        error_msg += warning + "; ";
+                    }
+                }
+
+                // Add provider metadata if available
+                if (result.provider_metadata.has_value())
+                {
+                    error_msg += " | Provider metadata: " + result.provider_metadata.value();
+                }
+
+                // Add retryable status if available
+                if (result.is_retryable.has_value())
+                {
+                    error_msg += result.is_retryable.value() ? " | Status: Retryable" : " | Status: Non-retryable";
+                }
+
+                // Add finish reason
+                error_msg += " | Finish reason: " + result.finishReasonToString();
+
                 ereport(ERROR,
                         (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                         errmsg("OpenRouter API error: %s", result.error_message().c_str())));
+                         errmsg("%s", error_msg.c_str())));
             }
         }
         catch (const std::exception &e)
@@ -130,7 +172,7 @@ extern "C"
                                    "OpenRouter Base URL",
                                    "Base URL for OpenRouter API",
                                    &openrouter_base_url,
-                                   "https://openrouter.ai/api/v1",
+                                   "https://openrouter.ai/api",
                                    PGC_USERSET,
                                    0,
                                    nullptr,
