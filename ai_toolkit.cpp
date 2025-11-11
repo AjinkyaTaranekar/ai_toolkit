@@ -758,12 +758,6 @@ extern "C"
                 }
                 log_output << "\n";
 
-                if (!step.response_id.empty())
-                {
-                    log_output << "[INFO] Text generation successful - model: " << step.model_used
-                               << ", response_id: " << step.response_id << "\n";
-                }
-
                 elog(NOTICE, "%s", log_output.str().c_str());
                 log_output.str("");
                 log_output.clear();
@@ -771,7 +765,7 @@ extern "C"
 
             options.on_tool_call_start = [&log_output](const ai::ToolCall &call)
             {
-                log_output << "🔧 Calling: " << call.name;
+                log_output << "🔧 Calling: " << call.tool_name;
                 if (!call.id.empty())
                 {
                     // Show truncated ID
