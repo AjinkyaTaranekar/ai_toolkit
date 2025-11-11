@@ -793,7 +793,7 @@ extern "C"
 
             options.on_tool_call_finish = [&log_output](const ai::ToolResult &result)
             {
-                log_output << "✓ " << result.name << " completed\n";
+                log_output << "✓ " << result.tool_name << " completed\n";
 
                 // Show a summary of the result
                 if (!result.result.empty() && !result.result.is_null())
@@ -801,7 +801,7 @@ extern "C"
                     if (result.result.contains("success") && result.result["success"] == true)
                     {
                         // Format based on tool type
-                        if (result.name == "list_databases" && result.result.contains("count"))
+                        if (result.tool_name == "list_databases" && result.result.contains("count"))
                         {
                             int count = result.result["count"];
                             std::string preview;
@@ -820,7 +820,7 @@ extern "C"
                             }
                             log_output << "  └─ Found " << count << " databases: " << preview << "\n";
                         }
-                        else if (result.name == "list_tables_in_database" && result.result.contains("count"))
+                        else if (result.tool_name == "list_tables_in_database" && result.result.contains("count"))
                         {
                             int count = result.result["count"];
                             std::string db = result.result.value("database", "");
@@ -840,19 +840,19 @@ extern "C"
                             }
                             log_output << "  └─ Found " << count << " tables in database '" << db << "': " << preview << "\n";
                         }
-                        else if (result.name == "get_schema_for_table" && result.result.contains("table"))
+                        else if (result.tool_name == "get_schema_for_table" && result.result.contains("table"))
                         {
                             std::string table = result.result["table"];
                             int col_count = result.result.contains("columns") ? result.result["columns"].size() : 0;
                             log_output << "  └─ Retrieved schema for '" << table << "' (" << col_count << " columns)\n";
                         }
-                        else if (result.name == "set_memory")
+                        else if (result.tool_name == "set_memory")
                         {
                             std::string category = result.result.value("category", "");
                             std::string key = result.result.value("key", "");
                             log_output << "  └─ Saved memory: [" << category << "] " << key << "\n";
                         }
-                        else if (result.name == "get_memory")
+                        else if (result.tool_name == "get_memory")
                         {
                             std::string category = result.result.value("category", "");
                             std::string key = result.result.value("key", "");
