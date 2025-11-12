@@ -223,16 +223,22 @@ extern "C"
                 HeapTuple tuple = SPI_tuptable->vals[i];
                 TupleDesc tupdesc = SPI_tuptable->tupdesc;
 
-                Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+                Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 
-                std::string schema_name = TextDatumGetCString(schema_datum);
-
-                if (!schema_name.empty())
+                if (isnull)
                 {
-                    databases.push_back(schema_name);
-                    elog(LOG, "[tool_list_databases] Added database: %s", schema_name.c_str());
+                    elog(LOG, "[tool_list_databases] Encountered NULL database name");
+                    continue;
                 }
-                
+
+                char *database_name_cstr = TextDatumGetCString(database_datum);
+                std::string database_name = database_name_cstr ? database_name_cstr : "";
+
+                if (!database_name.empty())
+                {
+                    databases.push_back(database_name);
+                    elog(LOG, "[tool_list_databases] Added database: %s", database_name.c_str());
+                }
             }
 
             elog(LOG, "[tool_list_databases] Returning result");
@@ -302,7 +308,6 @@ extern "C"
                     tables.push_back(full_name);
                     elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
                 }
-            
             }
 
             elog(LOG, "[tool_list_tables_in_database] Returning result");
@@ -397,7 +402,7 @@ extern "C"
 
                 if (!col_name.empty() && !col_type.empty() && !col_nullable.empty())
                 {
-                    
+
                     nlohmann::json col_info;
                     col_info["name"] = col_name;
                     col_info["type"] = col_type;
