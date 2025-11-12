@@ -183,9 +183,9 @@ extern "C"
             "calculation, permission, custom\n\n"
             "=== RESPONSE FORMAT ===\n"
             "Generate your SQL query ONLY in this exact format:\n"
-            "```sql\n"
+            "<sql>\n"
             "<your SELECT query here>\n"
-            "```\n"
+            "</sql>\n"
             "No other text or explanation is needed.\n";
 
         // If no prompt file is configured, use default
@@ -813,6 +813,12 @@ extern "C"
             // Build system prompt with step-by-step process
             std::string system_prompt = load_system_prompt();
 
+            user_prompt = "User request: `" + user_prompt + "`\n"
+                                                            "Generate a valid Postgres SELECT query based on the request. "
+                                                            "Follow the strict step-by-step process in the system prompt. "
+                                                            "Use the available tools to explore the database schema and retrieve necessary information. "
+                                                            "Only generate SELECT queries. Never modify data.";
+
             // Configure generation options with tools
             ai::GenerateOptions options(model, system_prompt, user_prompt);
             options.tools["set_memory"] = set_memory_tool;
@@ -962,12 +968,12 @@ extern "C"
                 std::string response_text = result.text;
                 std::string sql_query;
 
-                // Look for ```sql ... ``` pattern
-                size_t sql_start = response_text.find("```sql");
+                // Look for <sql> ... </sql> pattern
+                size_t sql_start = response_text.find("<sql>");
                 if (sql_start != std::string::npos)
                 {
-                    sql_start += 6; // Move past "```sql"
-                    size_t sql_end = response_text.find("```", sql_start);
+                    sql_start += 5; // Move past "<sql>"
+                    size_t sql_end = response_text.find("</sql>", sql_start);
                     if (sql_end != std::string::npos)
                     {
                         sql_query = response_text.substr(sql_start, sql_end - sql_start);
@@ -1059,7 +1065,7 @@ extern "C"
                     SPI_finish();
                     ereport(ERROR,
                             (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                             errmsg("No SQL query found in response. Expected format: ```sql <query> ```")));
+                             errmsg("No SQL query found in response. Expected format: <sql><query></sql>")));
                 }
             }
             else
