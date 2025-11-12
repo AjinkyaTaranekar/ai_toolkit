@@ -199,37 +199,30 @@ extern "C"
      */
     nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
-        elog(LOG, "[tool_list_databases] === START ===");
-
         // Check SPI connection state
         if (SPI_connect() == SPI_ERROR_CONNECT)
         {
-            elog(WARNING, "[tool_list_databases] SPI already connected (expected in tool context)");
+            // SPI already connected (expected in tool context) - not an error
         }
         else
         {
-            elog(LOG, "[tool_list_databases] SPI_connect successful");
             SPI_finish();
         }
 
         const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
 
-        elog(LOG, "[tool_list_databases] Executing query");
         int ret = SPI_execute(sql, true, 0);
-        elog(LOG, "[tool_list_databases] SPI_execute returned: %d (expected: %d)", ret, SPI_OK_SELECT);
 
         if (ret != SPI_OK_SELECT)
         {
-            elog(ERROR, "[tool_list_databases] Query failed with code: %d", ret);
+            elog(WARNING, "[tool_list_databases] Query failed with code: %d", ret);
             nlohmann::json error_result;
             error_result["success"] = false;
             error_result["error"] = "Failed to query databases";
-            elog(LOG, "[tool_list_databases] === END (ERROR) ===");
             return error_result;
         }
 
         uint64 row_count = SPI_processed;
-        elog(LOG, "[tool_list_databases] Processing %lu rows", (unsigned long)row_count);
 
         // Use vector first, then convert to json at the end
         std::vector<std::string> database_list;
@@ -237,91 +230,52 @@ extern "C"
 
         for (uint64 i = 0; i < row_count; i++)
         {
-            elog(LOG, "[tool_list_databases] Processing row %lu/%lu", (unsigned long)(i + 1), (unsigned long)row_count);
-
             bool isnull = false;
             HeapTuple tuple = SPI_tuptable->vals[i];
             TupleDesc tupdesc = SPI_tuptable->tupdesc;
 
-            elog(LOG, "[tool_list_databases] Getting binary value for row %lu", (unsigned long)i);
             Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 
             if (isnull)
             {
-                elog(WARNING, "[tool_list_databases] Row %lu has NULL database name, skipping", (unsigned long)i);
+                elog(WARNING, "[tool_list_databases] Skipping NULL database name at row %lu", (unsigned long)i);
                 continue;
             }
-
-            elog(LOG, "[tool_list_databases] Converting datum to text for row %lu", (unsigned long)i);
 
             // Use SPI_getvalue instead of TextDatumGetCString - it's safer
             char *database_name_cstr = SPI_getvalue(tuple, tupdesc, 1);
 
             if (database_name_cstr == NULL)
             {
-                elog(WARNING, "[tool_list_databases] SPI_getvalue returned NULL for row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_databases] Failed to get database name at row %lu", (unsigned long)i);
                 continue;
             }
 
-            elog(LOG, "[tool_list_databases] Row %lu database name C-string: '%s'", (unsigned long)i, database_name_cstr);
-
             // Create string and immediately free
             std::string database_name(database_name_cstr);
-            elog(LOG, "[tool_list_databases] Row %lu database name std::string: '%s'", (unsigned long)i, database_name.c_str());
-
             pfree(database_name_cstr);
-            elog(LOG, "[tool_list_databases] Freed C-string for row %lu", (unsigned long)i);
 
             if (!database_name.empty())
             {
                 database_list.push_back(database_name);
-                elog(LOG, "[tool_list_databases] Added database '%s' to list (total: %lu)",
-                     database_name.c_str(), (unsigned long)database_list.size());
-            }
-            else
-            {
-                elog(WARNING, "[tool_list_databases] Empty database name at row %lu", (unsigned long)i);
             }
         }
 
-        elog(LOG, "[tool_list_databases] Finished processing all rows, creating JSON response");
-
-        // Build JSON response carefully
+        // Build JSON response
         nlohmann::json result;
-
-        elog(LOG, "[tool_list_databases] Setting success field");
         result["success"] = true;
-
-        elog(LOG, "[tool_list_databases] Setting count field: %lu", (unsigned long)database_list.size());
         result["count"] = database_list.size();
+        result["databases"] = database_list;
 
-        elog(LOG, "[tool_list_databases] Creating databases array");
-        nlohmann::json databases_array = nlohmann::json::array();
-
-        for (size_t i = 0; i < database_list.size(); i++)
-        {
-            elog(LOG, "[tool_list_databases] Adding database %lu/%lu to JSON: '%s'",
-                 (unsigned long)(i + 1), (unsigned long)database_list.size(), database_list[i].c_str());
-            databases_array.push_back(database_list[i]);
-        }
-
-        elog(LOG, "[tool_list_databases] Setting databases field");
-        result["databases"] = databases_array;
-
-        elog(LOG, "[tool_list_databases] JSON response created successfully");
-        elog(LOG, "[tool_list_databases] Response dump: %s", result.dump().c_str());
-        elog(LOG, "[tool_list_databases] === END (SUCCESS) ===");
-
+        elog(LOG, "[tool_list_databases] Retrieved %lu databases", (unsigned long)database_list.size());
         return result;
     }
-    
+
     /**
      * Tool function: List all tables in a specific database
      */
     nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
-        elog(LOG, "[tool_list_tables_in_database] Starting execution");
-
         if (!params.contains("database"))
         {
             elog(WARNING, "[tool_list_tables_in_database] Missing database parameter");
@@ -329,23 +283,28 @@ extern "C"
         }
 
         std::string database = params["database"].get<std::string>();
-        elog(LOG, "[tool_list_tables_in_database] Database parameter: %s", database.c_str());
 
-        std::string sql = "SELECT schemaname, tablename FROM pg_tables "
-                          "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
-                          "ORDER BY schemaname, tablename";
+        // Query tables from a specific database using information_schema
+        // The table_catalog column in information_schema.tables contains the database name
+        std::string sql = "SELECT table_schema, table_name FROM information_schema.tables "
+                          "WHERE table_catalog = $1 "
+                          "AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                          "AND table_type = 'BASE TABLE' "
+                          "ORDER BY table_schema, table_name";
 
-        elog(LOG, "[tool_list_tables_in_database] About to execute query");
-        int ret = SPI_execute(sql.c_str(), true, 0);
-        elog(LOG, "[tool_list_tables_in_database] SPI_execute() returned: %d", ret);
+        Datum values[1];
+        char nulls[1] = {' '};
+        values[0] = CStringGetTextDatum(database.c_str());
+        Oid argtypes[1] = {TEXTOID};
+
+        int ret = SPI_execute_with_args(sql.c_str(), 1, argtypes, values, nulls, true, 0);
 
         if (ret != SPI_OK_SELECT)
         {
-            elog(WARNING, "[tool_list_tables_in_database] Query execution failed with code: %d", ret);
+            elog(WARNING, "[tool_list_tables_in_database] Query execution failed with code: %d for database: %s", ret, database.c_str());
             return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
         }
 
-        elog(LOG, "[tool_list_tables_in_database] Query successful, processed %lu rows", (unsigned long)SPI_processed);
         nlohmann::json tables = nlohmann::json::array();
 
         for (uint64 i = 0; i < SPI_processed; i++)
@@ -359,17 +318,17 @@ extern "C"
 
             if (isnull_schema || isnull_table)
             {
-                elog(WARNING, "[tool_list_tables_in_database] NULL schema or table at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_tables_in_database] Skipping row with NULL schema or table");
                 continue;
             }
 
-            // CRITICAL FIX: Properly handle memory
+            // Properly handle memory
             char *schema_cstr = TextDatumGetCString(schema_datum);
             char *table_cstr = TextDatumGetCString(table_datum);
 
             if (schema_cstr == NULL || table_cstr == NULL)
             {
-                elog(WARNING, "[tool_list_tables_in_database] TextDatumGetCString returned NULL at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_tables_in_database] Failed to get string values from datum");
                 if (schema_cstr)
                     pfree(schema_cstr);
                 if (table_cstr)
@@ -381,7 +340,7 @@ extern "C"
             std::string schema_str(schema_cstr);
             std::string table_str(table_cstr);
 
-            // CRITICAL: Free memory
+            // Free memory
             pfree(schema_cstr);
             pfree(table_cstr);
 
@@ -389,11 +348,10 @@ extern "C"
             {
                 std::string full_name = schema_str + "." + table_str;
                 tables.push_back(full_name);
-                elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
             }
         }
 
-        elog(LOG, "[tool_list_tables_in_database] Returning result with %lu tables", (unsigned long)tables.size());
+        elog(LOG, "[tool_list_tables_in_database] Retrieved %lu tables from database '%s'", (unsigned long)tables.size(), database.c_str());
         return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
     }
 
@@ -402,8 +360,6 @@ extern "C"
      */
     nlohmann::json tool_get_schema_for_table(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
-        elog(LOG, "[tool_get_schema_for_table] Starting execution");
-
         if (!params.contains("table_name"))
         {
             elog(WARNING, "[tool_get_schema_for_table] Missing table_name parameter");
@@ -421,8 +377,6 @@ extern "C"
             table_name = table_name.substr(dot_pos + 1);
         }
 
-        elog(LOG, "[tool_get_schema_for_table] Schema: %s, Table: %s", schema_name.c_str(), table_name.c_str());
-
         std::string columns_sql =
             "SELECT column_name, data_type, character_maximum_length, "
             "is_nullable, column_default "
@@ -430,7 +384,6 @@ extern "C"
             "WHERE table_schema = $1 AND table_name = $2 "
             "ORDER BY ordinal_position";
 
-        elog(LOG, "[tool_get_schema_for_table] About to execute query with args");
         Datum values[2];
         char nulls[2] = {' ', ' '};
         values[0] = CStringGetTextDatum(schema_name.c_str());
@@ -438,12 +391,10 @@ extern "C"
         Oid argtypes[2] = {TEXTOID, TEXTOID};
 
         int ret = SPI_execute_with_args(columns_sql.c_str(), 2, argtypes, values, nulls, true, 0);
-        elog(LOG, "[tool_get_schema_for_table] SPI_execute_with_args() returned: %d, processed: %lu",
-             ret, (unsigned long)SPI_processed);
 
         if (ret != SPI_OK_SELECT || SPI_processed == 0)
         {
-            elog(WARNING, "[tool_get_schema_for_table] Table not found or query failed");
+            elog(WARNING, "[tool_get_schema_for_table] Table '%s.%s' not found or no columns", schema_name.c_str(), table_name.c_str());
             return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
         }
 
@@ -477,14 +428,14 @@ extern "C"
             Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
             bool default_isnull = isnull;
 
-            // CRITICAL FIX: Proper memory handling
+            // Properly handle memory
             char *col_name_cstr = TextDatumGetCString(col_name_datum);
             char *col_type_cstr = TextDatumGetCString(col_type_datum);
             char *col_nullable_cstr = TextDatumGetCString(col_nullable_datum);
 
             if (!col_name_cstr || !col_type_cstr || !col_nullable_cstr)
             {
-                elog(WARNING, "[tool_get_schema_for_table] NULL pointer from TextDatumGetCString at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_get_schema_for_table] Failed to retrieve column information");
                 if (col_name_cstr)
                     pfree(col_name_cstr);
                 if (col_type_cstr)
@@ -528,7 +479,7 @@ extern "C"
                 if (col_default_cstr)
                 {
                     std::string col_default(col_default_cstr);
-                    pfree(col_default_cstr); // CRITICAL: Free memory
+                    pfree(col_default_cstr);
 
                     create_sql << " DEFAULT " << col_default;
                     col_info["default"] = col_default;
@@ -544,7 +495,7 @@ extern "C"
 
         create_sql << "\n);";
 
-        elog(LOG, "[tool_get_schema_for_table] Schema generation complete, returning result");
+        elog(LOG, "[tool_get_schema_for_table] Retrieved schema for '%s.%s' with %lu columns", schema_name.c_str(), table_name.c_str(), (unsigned long)columns.size());
         return nlohmann::json{
             {"success", true},
             {"table", schema_name + "." + table_name},
@@ -677,14 +628,12 @@ extern "C"
      */
     Datum query(PG_FUNCTION_ARGS)
     {
-        elog(LOG, "[query] Function starting");
         text *prompt_text = PG_GETARG_TEXT_PP(0);
 
         try
         {
             if (!openrouter_api_key)
             {
-                elog(LOG, "[query] OpenRouter API key not set");
                 ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("ai_toolkit.openrouter_api_key not set")));
@@ -695,28 +644,18 @@ extern "C"
             std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
             std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
 
-            elog(LOG, "[query] User prompt: %s", user_prompt.c_str());
-            elog(LOG, "[query] Model: %s", model.c_str());
-            elog(LOG, "[query] About to call SPI_connect() in main query function");
-
             // Connect to SPI for tool functions to use
             if (SPI_connect() != SPI_OK_CONNECT)
             {
-                elog(LOG, "[query] SPI_connect() failed in main query function");
                 ereport(ERROR,
                         (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                          errmsg("Failed to connect to SPI")));
             }
 
-            elog(LOG, "[query] SPI_connect() successful in main query function");
-
             // Create AI client
-            elog(LOG, "[query] About to create AI client");
             auto client = ai::openai::create_client(api_key, base_url);
-            elog(LOG, "[query] AI client created successfully");
 
             // Define tools for memory operations using helper functions
-            elog(LOG, "[query] Defining tools");
             ai::Tool set_memory_tool = ai::create_simple_tool(
                 "set_memory",
                 "Store information about database schema, tables, columns, relationships, or business rules for future reference. "
@@ -949,9 +888,7 @@ extern "C"
             };
 
             // Generate response
-            elog(LOG, "[query] About to call client.generate_text()");
             auto result = client.generate_text(options);
-            elog(LOG, "[query] client.generate_text() completed");
 
             if (result)
             {
@@ -982,22 +919,18 @@ extern "C"
                 {
                     // Execute the SQL query
                     elog(NOTICE, "\n📋 Generated Query:\n%s\n", sql_query.c_str());
-                    elog(LOG, "[query] About to execute generated SQL query");
 
                     // SPI is already connected from the beginning of the function
                     int ret = SPI_execute(sql_query.c_str(), true, 0);
-                    elog(LOG, "[query] SQL query execution returned: %d", ret);
 
                     if (ret < 0)
                     {
-                        elog(LOG, "[query] SQL query execution failed");
                         SPI_finish();
                         ereport(ERROR,
                                 (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
                                  errmsg("Query execution failed")));
                     }
 
-                    elog(LOG, "[query] SQL query executed successfully");
                     // Print results as a table
                     if (SPI_processed > 0)
                     {
@@ -1052,14 +985,11 @@ extern "C"
                         elog(NOTICE, "\n✓ Query executed successfully. No rows returned.\n");
                     }
 
-                    elog(LOG, "[query] About to call SPI_finish() before return");
                     SPI_finish();
-                    elog(LOG, "[query] SPI_finish() successful, returning void");
                     PG_RETURN_VOID();
                 }
                 else
                 {
-                    elog(LOG, "[query] No SQL query found in response");
                     SPI_finish();
                     ereport(ERROR,
                             (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
@@ -1074,7 +1004,6 @@ extern "C"
                     error_msg += " | " + result.error.value();
                 }
 
-                elog(LOG, "[query] AI generation failed: %s", error_msg.c_str());
                 SPI_finish();
                 ereport(ERROR,
                         (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
@@ -1083,7 +1012,6 @@ extern "C"
         }
         catch (const std::exception &e)
         {
-            elog(LOG, "[query] Caught exception in main query function: %s", e.what());
             SPI_finish();
             ereport(ERROR,
                     (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
