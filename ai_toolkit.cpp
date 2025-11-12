@@ -3,6 +3,8 @@
 #include <string>
 #include <sstream>
 #include <optional>
+#include <fstream>
+#include <filesystem>
 
 #include <ai/ai.h>
 #include <ai/logger.h>
@@ -26,6 +28,7 @@ extern "C"
     static char *openrouter_api_key = nullptr;
     static char *openrouter_model = nullptr;
     static char *openrouter_base_url = nullptr;
+    static char *prompt_file_path = nullptr;
 
     /**
      * Core function to set memory in database
@@ -119,6 +122,118 @@ extern "C"
         if (manage_spi)
             SPI_finish();
         return std::nullopt;
+    }
+
+    /**
+     * Utility function to load system prompt from file
+     * Returns: prompt string from file if successful, or default hardcoded prompt if file cannot be read
+     */
+    std::string load_system_prompt()
+    {
+        // Default hardcoded prompt (used as fallback)
+        std::string default_prompt =
+            "You are a PostgreSQL database assistant. Your role is to help users write SELECT queries.\n\n"
+            "=== STRICT QUERY RESTRICTIONS ===\n"
+            "- ONLY SELECT queries are allowed\n"
+            "- NEVER generate DROP, DELETE, UPDATE, or INSERT queries\n"
+            "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
+            "=== MANDATORY STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
+            "You MUST follow these steps in order. DO NOT skip any steps or make assumptions:\n\n"
+            "1. MANDATORY: EXPLORE SCHEMAS FIRST\n"
+            "   - ALWAYS start by calling list_schemas() to see all available schemas\n"
+            "   - This is REQUIRED - do not skip this step\n"
+            "   - DO NOT assume you know what schemas exist\n"
+            "2. MANDATORY: EXPLORE TABLES IN RELEVANT SCHEMA\n"
+            "   - ALWAYS call list_tables_in_schema() for each relevant schema\n"
+            "   - This is REQUIRED - do not skip this step\n"
+            "   - DO NOT assume you know what tables exist in a schema\n"
+            "   - DO NOT hallucinate table names\n\n"
+            "3. MANDATORY: GET TABLE SCHEMAS\n"
+            "   - ALWAYS call get_schema_for_table() for ALL tables that might be relevant to the query\n"
+            "   - This is REQUIRED - do not skip this step\n"
+            "   - Use the fully qualified name: schema.table (e.g., 'users.users', 'products.products')\n"
+            "   - DO NOT assume column names or data types\n"
+            "   - DO NOT hallucinate column names\n\n"
+            "4. CHECK MEMORY FOR ADDITIONAL CONTEXT\n"
+            "   - Use get_memory to check for:\n"
+            "     * get_memory('table', 'schema.table_name') - table descriptions and usage notes\n"
+            "     * get_memory('column', 'schema.table.column') - column details and meanings\n"
+            "     * get_memory('relationship', 'table1_table2') - join patterns\n"
+            "     * get_memory('business_rule', 'rule_name') - business logic constraints\n"
+            "     * get_memory('data_pattern', 'pattern_name') - common data patterns\n"
+            "   - Consider any special filtering rules, calculated fields, or data quirks\n\n"
+            "5. GENERATE THE QUERY\n"
+            "   - Build the SELECT query based ONLY on the information gathered from tables and schema tools\n"
+            "   - Don't worry if you don't have context from the memory you co-relate based on the table structure information\n"
+            "   - Use ONLY table names and columns that were returned by get_schema_for_table\n"
+            "   - Use schema-qualified names in your query (e.g., 'users.users', 'orders.orders')\n"
+            "   - DO NOT make assumptions or hallucinate schema information\n"
+            "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
+            "⚠️  CRITICAL: You MUST call list_tables_in_schema and get_schema_for_table\n"
+            "    for EVERY query. Never skip these steps. Never assume schema information. Never hallucinate.\n\n"
+            "=== AVAILABLE TOOLS ===\n"
+            "Schema exploration:\n"
+            "- list_schemas() - List all available schemas in the current database\n"
+            "- list_tables_in_schema(schema) - List all tables in a specific schema\n"
+            "- get_schema_for_table(table_name) - Get CREATE TABLE statement for a table\n\n"
+            "Memory operations:\n"
+            "- get_memory(category, key) - Retrieve stored information\n"
+            "- set_memory(category, key, value, notes) - Store information for future use\n\n"
+            "Memory categories: table, column, relationship, business_rule, data_pattern, "
+            "calculation, permission, custom\n\n"
+            "=== RESPONSE FORMAT ===\n"
+            "Generate your SQL query ONLY in this exact format:\n"
+            "```sql\n"
+            "<your SELECT query here>\n"
+            "```\n"
+            "No other text or explanation is needed.\n";
+
+        // If no prompt file is configured, use default
+        if (!prompt_file_path || strlen(prompt_file_path) == 0)
+        {
+            elog(LOG, "[load_system_prompt] No prompt file configured, using default prompt");
+            return default_prompt;
+        }
+
+        try
+        {
+            std::filesystem::path file_path(prompt_file_path);
+
+            // Check if file exists
+            if (!std::filesystem::exists(file_path))
+            {
+                elog(WARNING, "[load_system_prompt] Prompt file not found at '%s', using default prompt", prompt_file_path);
+                return default_prompt;
+            }
+
+            // Read file contents
+            std::ifstream file(file_path);
+            if (!file.is_open())
+            {
+                elog(WARNING, "[load_system_prompt] Failed to open prompt file at '%s', using default prompt", prompt_file_path);
+                return default_prompt;
+            }
+
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            file.close();
+
+            std::string file_content = buffer.str();
+
+            if (file_content.empty())
+            {
+                elog(WARNING, "[load_system_prompt] Prompt file is empty at '%s', using default prompt", prompt_file_path);
+                return default_prompt;
+            }
+
+            elog(LOG, "[load_system_prompt] Successfully loaded prompt from '%s' (%zu bytes)", prompt_file_path, file_content.length());
+            return file_content;
+        }
+        catch (const std::exception &e)
+        {
+            elog(WARNING, "[load_system_prompt] Exception while reading prompt file: %s, using default prompt", e.what());
+            return default_prompt;
+        }
     }
 
     /**
@@ -696,62 +811,7 @@ extern "C"
                 tool_get_schema_for_table);
 
             // Build system prompt with step-by-step process
-            std::string system_prompt =
-                "You are a PostgreSQL database assistant. Your role is to help users write SELECT queries.\n\n"
-                "=== STRICT QUERY RESTRICTIONS ===\n"
-                "- ONLY SELECT queries are allowed\n"
-                "- NEVER generate DROP, DELETE, UPDATE, or INSERT queries\n"
-                "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
-                "=== MANDATORY STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
-                "You MUST follow these steps in order. DO NOT skip any steps or make assumptions:\n\n"
-                "1. MANDATORY: EXPLORE SCHEMAS FIRST\n"
-                "   - ALWAYS start by calling list_schemas() to see all available schemas\n"
-                "   - This is REQUIRED - do not skip this step\n"
-                "   - DO NOT assume you know what schemas exist\n"
-                "2. MANDATORY: EXPLORE TABLES IN RELEVANT SCHEMA\n"
-                "   - ALWAYS call list_tables_in_schema() for each relevant schema\n"
-                "   - This is REQUIRED - do not skip this step\n"
-                "   - DO NOT assume you know what tables exist in a schema\n"
-                "   - DO NOT hallucinate table names\n\n"
-                "3. MANDATORY: GET TABLE SCHEMAS\n"
-                "   - ALWAYS call get_schema_for_table() for ALL tables that might be relevant to the query\n"
-                "   - This is REQUIRED - do not skip this step\n"
-                "   - Use the fully qualified name: schema.table (e.g., 'users.users', 'products.products')\n"
-                "   - DO NOT assume column names or data types\n"
-                "   - DO NOT hallucinate column names\n\n"
-                "4. CHECK MEMORY FOR ADDITIONAL CONTEXT\n"
-                "   - Use get_memory to check for:\n"
-                "     * get_memory('table', 'schema.table_name') - table descriptions and usage notes\n"
-                "     * get_memory('column', 'schema.table.column') - column details and meanings\n"
-                "     * get_memory('relationship', 'table1_table2') - join patterns\n"
-                "     * get_memory('business_rule', 'rule_name') - business logic constraints\n"
-                "     * get_memory('data_pattern', 'pattern_name') - common data patterns\n"
-                "   - Consider any special filtering rules, calculated fields, or data quirks\n\n"
-                "5. GENERATE THE QUERY\n"
-                "   - Build the SELECT query based ONLY on the information gathered from tables and schema tools\n"
-                "   - Don't worry if you don't have context from the memory you co-relate based on the table structure information\n"
-                "   - Use ONLY table names and columns that were returned by get_schema_for_table\n"
-                "   - Use schema-qualified names in your query (e.g., 'users.users', 'orders.orders')\n"
-                "   - DO NOT make assumptions or hallucinate schema information\n"
-                "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
-                "⚠️  CRITICAL: You MUST call list_tables_in_schema and get_schema_for_table\n"
-                "    for EVERY query. Never skip these steps. Never assume schema information. Never hallucinate.\n\n"
-                "=== AVAILABLE TOOLS ===\n"
-                "Schema exploration:\n"
-                "- list_schemas() - List all available schemas in the current database\n"
-                "- list_tables_in_schema(schema) - List all tables in a specific schema\n"
-                "- get_schema_for_table(table_name) - Get CREATE TABLE statement for a table\n\n"
-                "Memory operations:\n"
-                "- get_memory(category, key) - Retrieve stored information\n"
-                "- set_memory(category, key, value, notes) - Store information for future use\n\n"
-                "Memory categories: table, column, relationship, business_rule, data_pattern, "
-                "calculation, permission, custom\n\n"
-                "=== RESPONSE FORMAT ===\n"
-                "Generate your SQL query ONLY in this exact format:\n"
-                "```sql\n"
-                "<your SELECT query here>\n"
-                "```\n"
-                "No other text or explanation is needed.\n";
+            std::string system_prompt = load_system_prompt();
 
             // Configure generation options with tools
             ai::GenerateOptions options(model, system_prompt, user_prompt);
@@ -1057,6 +1117,19 @@ extern "C"
                                    "Base URL for OpenRouter API",
                                    &openrouter_base_url,
                                    "https://openrouter.ai/api",
+                                   PGC_USERSET,
+                                   0,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr);
+
+        DefineCustomStringVariable("ai_toolkit.prompt_file",
+                                   "AI Prompt File Path",
+                                   "Path to a text file containing the system prompt for the AI. "
+                                   "If not set or file does not exist, uses the default hardcoded prompt. "
+                                   "Allows changing the prompt without rebuilding the extension.",
+                                   &prompt_file_path,
+                                   nullptr,
                                    PGC_USERSET,
                                    0,
                                    nullptr,
