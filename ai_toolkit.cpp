@@ -222,17 +222,17 @@ extern "C"
                 bool isnull;
                 HeapTuple tuple = SPI_tuptable->vals[i];
                 TupleDesc tupdesc = SPI_tuptable->tupdesc;
-                Datum datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 
-                if (!isnull)
+                Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+
+                std::string schema_name = TextDatumGetCString(schema_datum);
+
+                if (schema_name)
                 {
-                    char *dbname_str = TextDatumGetCString(datum);
-                    if (dbname_str)
-                    {
-                        databases.push_back(std::string(dbname_str));
-                        elog(LOG, "[tool_list_databases] Added database: %s", dbname_str);
-                    }
+                    databases.push_back(schema_name);
+                    elog(LOG, "[tool_list_databases] Added database: %s", schema_name.c_str());
                 }
+                
             }
 
             elog(LOG, "[tool_list_databases] Returning result");
@@ -294,17 +294,15 @@ extern "C"
                 Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
                 Datum table_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
 
-                if (!isnull)
+                std::string schema_str = TextDatumGetCString(schema_datum);
+                std::string table_str = TextDatumGetCString(table_datum);
+                if (!schema_str.empty() && !table_str.empty())
                 {
-                    char *schema_str = TextDatumGetCString(schema_datum);
-                    char *table_str = TextDatumGetCString(table_datum);
-                    if (schema_str && table_str)
-                    {
-                        std::string full_name = std::string(schema_str) + "." + std::string(table_str);
-                        tables.push_back(full_name);
-                        elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
-                    }
+                    std::string full_name = schema_str + "." + table_str;
+                    tables.push_back(full_name);
+                    elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
                 }
+            
             }
 
             elog(LOG, "[tool_list_tables_in_database] Returning result");
@@ -393,16 +391,13 @@ extern "C"
                 Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
                 bool default_isnull = isnull;
 
-                char *col_name_str = TextDatumGetCString(col_name_datum);
-                char *col_type_str = TextDatumGetCString(col_type_datum);
-                char *col_nullable_str = TextDatumGetCString(col_nullable_datum);
+                std::string col_name = TextDatumGetCString(col_name_datum);
+                std::string col_type = TextDatumGetCString(col_type_datum);
+                std::string col_nullable = TextDatumGetCString(col_nullable_datum);
 
-                if (col_name_str && col_type_str && col_nullable_str)
+                if (!col_name.empty() && !col_type.empty() && !col_nullable.empty())
                 {
-                    std::string col_name(col_name_str);
-                    std::string col_type(col_type_str);
-                    std::string col_nullable(col_nullable_str);
-
+                    
                     nlohmann::json col_info;
                     col_info["name"] = col_name;
                     col_info["type"] = col_type;
