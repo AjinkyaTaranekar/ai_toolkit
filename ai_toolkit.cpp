@@ -195,9 +195,9 @@ extern "C"
     }
 
     /**
-     * Tool function: List all databases in the PostgreSQL instance
+     * Tool function: List all schemas in the PostgreSQL database
      */
-    nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
+    nlohmann::json tool_list_schemas(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         // Check SPI connection state
         if (SPI_connect() == SPI_ERROR_CONNECT)
@@ -209,24 +209,26 @@ extern "C"
             SPI_finish();
         }
 
-        const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
+        const char *sql = "SELECT schema_name FROM information_schema.schemata "
+                          "WHERE schema_name NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'pg_toast_temp_1') "
+                          "ORDER BY schema_name";
 
         int ret = SPI_execute(sql, true, 0);
 
         if (ret != SPI_OK_SELECT)
         {
-            elog(WARNING, "[tool_list_databases] Query failed with code: %d", ret);
+            elog(WARNING, "[tool_list_schemas] Query failed with code: %d", ret);
             nlohmann::json error_result;
             error_result["success"] = false;
-            error_result["error"] = "Failed to query databases";
+            error_result["error"] = "Failed to query schemas";
             return error_result;
         }
 
         uint64 row_count = SPI_processed;
 
         // Use vector first, then convert to json at the end
-        std::vector<std::string> database_list;
-        database_list.reserve(row_count);
+        std::vector<std::string> schema_list;
+        schema_list.reserve(row_count);
 
         for (uint64 i = 0; i < row_count; i++)
         {
@@ -234,74 +236,73 @@ extern "C"
             HeapTuple tuple = SPI_tuptable->vals[i];
             TupleDesc tupdesc = SPI_tuptable->tupdesc;
 
-            Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+            Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 
             if (isnull)
             {
-                elog(WARNING, "[tool_list_databases] Skipping NULL database name at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_schemas] Skipping NULL schema name at row %lu", (unsigned long)i);
                 continue;
             }
 
             // Use SPI_getvalue instead of TextDatumGetCString - it's safer
-            char *database_name_cstr = SPI_getvalue(tuple, tupdesc, 1);
+            char *schema_name_cstr = SPI_getvalue(tuple, tupdesc, 1);
 
-            if (database_name_cstr == NULL)
+            if (schema_name_cstr == NULL)
             {
-                elog(WARNING, "[tool_list_databases] Failed to get database name at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_schemas] Failed to get schema name at row %lu", (unsigned long)i);
                 continue;
             }
 
             // Create string and immediately free
-            std::string database_name(database_name_cstr);
-            pfree(database_name_cstr);
+            std::string schema_name(schema_name_cstr);
+            pfree(schema_name_cstr);
 
-            if (!database_name.empty())
+            if (!schema_name.empty())
             {
-                database_list.push_back(database_name);
+                schema_list.push_back(schema_name);
             }
         }
 
         // Build JSON response
         nlohmann::json result;
         result["success"] = true;
-        result["count"] = database_list.size();
-        result["databases"] = database_list;
+        result["count"] = schema_list.size();
+        result["schemas"] = schema_list;
 
-        elog(LOG, "[tool_list_databases] Retrieved %lu databases", (unsigned long)database_list.size());
+        elog(LOG, "[tool_list_schemas] Retrieved %lu schemas", (unsigned long)schema_list.size());
         return result;
     }
 
     /**
-     * Tool function: List all tables in a specific database
+     * Tool function: List all tables in a specific schema
      */
-    nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
+    nlohmann::json tool_list_tables_in_schema(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
-        if (!params.contains("database"))
+        if (!params.contains("schema"))
         {
-            elog(WARNING, "[tool_list_tables_in_database] Missing database parameter");
-            return nlohmann::json{{"success", false}, {"error", "Missing required parameter: database"}};
+            elog(WARNING, "[tool_list_tables_in_schema] Missing schema parameter");
+            return nlohmann::json{{"success", false}, {"error", "Missing required parameter: schema"}};
         }
 
-        std::string database = params["database"].get<std::string>();
+        std::string schema = params["schema"].get<std::string>();
 
-        // Query tables from a specific database using information_schema
-        // The table_catalog column in information_schema.tables contains the database name
+        // Query tables from a specific schema using information_schema
+        // The table_schema column in information_schema.tables contains the schema name
         std::string sql = "SELECT table_schema, table_name FROM information_schema.tables "
-                          "WHERE table_catalog = $1 "
-                          "AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                          "WHERE table_schema = $1 "
                           "AND table_type = 'BASE TABLE' "
                           "ORDER BY table_schema, table_name";
 
         Datum values[1];
         char nulls[1] = {' '};
-        values[0] = CStringGetTextDatum(database.c_str());
+        values[0] = CStringGetTextDatum(schema.c_str());
         Oid argtypes[1] = {TEXTOID};
 
         int ret = SPI_execute_with_args(sql.c_str(), 1, argtypes, values, nulls, true, 0);
 
         if (ret != SPI_OK_SELECT)
         {
-            elog(WARNING, "[tool_list_tables_in_database] Query execution failed with code: %d for database: %s", ret, database.c_str());
+            elog(WARNING, "[tool_list_tables_in_schema] Query execution failed with code: %d for schema: %s", ret, schema.c_str());
             return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
         }
 
@@ -318,7 +319,7 @@ extern "C"
 
             if (isnull_schema || isnull_table)
             {
-                elog(WARNING, "[tool_list_tables_in_database] Skipping row with NULL schema or table");
+                elog(WARNING, "[tool_list_tables_in_schema] Skipping row with NULL schema or table");
                 continue;
             }
 
@@ -328,7 +329,7 @@ extern "C"
 
             if (schema_cstr == NULL || table_cstr == NULL)
             {
-                elog(WARNING, "[tool_list_tables_in_database] Failed to get string values from datum");
+                elog(WARNING, "[tool_list_tables_in_schema] Failed to get string values from datum");
                 if (schema_cstr)
                     pfree(schema_cstr);
                 if (table_cstr)
@@ -351,8 +352,8 @@ extern "C"
             }
         }
 
-        elog(LOG, "[tool_list_tables_in_database] Retrieved %lu tables from database '%s'", (unsigned long)tables.size(), database.c_str());
-        return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
+        elog(LOG, "[tool_list_tables_in_schema] Retrieved %lu tables from schema '%s'", (unsigned long)tables.size(), schema.c_str());
+        return nlohmann::json{{"success", true}, {"schema", schema}, {"tables", tables}, {"count", tables.size()}};
     }
 
     /**
@@ -673,17 +674,19 @@ extern "C"
                 tool_get_memory);
 
             // Define database exploration tools
-            ai::Tool list_databases_tool = ai::create_simple_tool(
-                "list_databases",
-                "List all available databases in the PostgreSQL instance. No parameters required.",
+            ai::Tool list_schemas_tool = ai::create_simple_tool(
+                "list_schemas",
+                "List all available schemas in the current PostgreSQL database. "
+                "Schemas: users (user data), products (catalog), cart (shopping), coupon (discounts), "
+                "wallet (payments), orders (order mgmt), payments (transactions), ai_toolkit (system). No parameters required.",
                 {},
-                tool_list_databases);
+                tool_list_schemas);
 
             ai::Tool list_tables_tool = ai::create_simple_tool(
-                "list_tables_in_database",
-                "List all tables in a specific database. Parameters: database (name of the database)",
-                {{"database", "string"}},
-                tool_list_tables_in_database);
+                "list_tables_in_schema",
+                "List all tables in a specific schema. Parameters: schema (name of the schema like 'users', 'products', 'orders', etc.)",
+                {{"schema", "string"}},
+                tool_list_tables_in_schema);
 
             ai::Tool get_schema_tool = ai::create_simple_tool(
                 "get_schema_for_table",
@@ -701,24 +704,25 @@ extern "C"
                 "- If user requests data modification operations, respond: 'I can only execute SELECT queries. Data modification operations are not permitted.'\n\n"
                 "=== MANDATORY STEP-BY-STEP QUERY GENERATION PROCESS ===\n"
                 "You MUST follow these steps in order. DO NOT skip any steps or make assumptions:\n\n"
-                "1. MANDATORY: EXPLORE DATABASES FIRST\n"
-                "   - ALWAYS start by calling list_databases() to see all available databases\n"
+                "1. MANDATORY: EXPLORE SCHEMAS FIRST\n"
+                "   - ALWAYS start by calling list_schemas() to see all available schemas\n"
                 "   - This is REQUIRED - do not skip this step\n"
-                "   - DO NOT assume you know what databases exist\n\n"
-                "2. MANDATORY: EXPLORE TABLES IN CURRENT DATABASE\n"
-                "   - ALWAYS call list_tables_in_database() to see all available tables\n"
+                "   - DO NOT assume you know what schemas exist\n"
+                "2. MANDATORY: EXPLORE TABLES IN RELEVANT SCHEMA\n"
+                "   - ALWAYS call list_tables_in_schema() for each relevant schema\n"
                 "   - This is REQUIRED - do not skip this step\n"
-                "   - DO NOT assume you know what tables exist\n"
+                "   - DO NOT assume you know what tables exist in a schema\n"
                 "   - DO NOT hallucinate table names\n\n"
                 "3. MANDATORY: GET TABLE SCHEMAS\n"
                 "   - ALWAYS call get_schema_for_table() for ALL tables that might be relevant to the query\n"
                 "   - This is REQUIRED - do not skip this step\n"
+                "   - Use the fully qualified name: schema.table (e.g., 'users.users', 'products.products')\n"
                 "   - DO NOT assume column names or data types\n"
                 "   - DO NOT hallucinate column names\n\n"
                 "4. CHECK MEMORY FOR ADDITIONAL CONTEXT\n"
                 "   - Use get_memory to check for:\n"
-                "     * get_memory('table', 'table_name') - table descriptions and usage notes\n"
-                "     * get_memory('column', 'table.column') - column details and meanings\n"
+                "     * get_memory('table', 'schema.table_name') - table descriptions and usage notes\n"
+                "     * get_memory('column', 'schema.table.column') - column details and meanings\n"
                 "     * get_memory('relationship', 'table1_table2') - join patterns\n"
                 "     * get_memory('business_rule', 'rule_name') - business logic constraints\n"
                 "     * get_memory('data_pattern', 'pattern_name') - common data patterns\n"
@@ -726,14 +730,15 @@ extern "C"
                 "5. GENERATE THE QUERY\n"
                 "   - Build the SELECT query based ONLY on the information gathered from tools\n"
                 "   - Use ONLY table names and columns that were returned by get_schema_for_table\n"
+                "   - Use schema-qualified names in your query (e.g., 'users.users', 'orders.orders')\n"
                 "   - DO NOT make assumptions or hallucinate schema information\n"
                 "   - If you discover new patterns or relationships, use set_memory to save them\n\n"
-                "⚠️  CRITICAL: You MUST call list_databases, list_tables_in_database, and get_schema_for_table\n"
+                "⚠️  CRITICAL: You MUST call list_tables_in_schema and get_schema_for_table\n"
                 "    for EVERY query. Never skip these steps. Never assume schema information. Never hallucinate.\n\n"
                 "=== AVAILABLE TOOLS ===\n"
-                "Database exploration:\n"
-                "- list_databases() - List all databases in PostgreSQL instance\n"
-                "- list_tables_in_database(database) - List all tables in a database\n"
+                "Schema exploration:\n"
+                "- list_schemas() - List all available schemas in the current database\n"
+                "- list_tables_in_schema(schema) - List all tables in a specific schema\n"
                 "- get_schema_for_table(table_name) - Get CREATE TABLE statement for a table\n\n"
                 "Memory operations:\n"
                 "- get_memory(category, key) - Retrieve stored information\n"
@@ -751,8 +756,8 @@ extern "C"
             ai::GenerateOptions options(model, system_prompt, user_prompt);
             options.tools["set_memory"] = set_memory_tool;
             options.tools["get_memory"] = get_memory_tool;
-            options.tools["list_databases"] = list_databases_tool;
-            options.tools["list_tables_in_database"] = list_tables_tool;
+            options.tools["list_schemas"] = list_schemas_tool;
+            options.tools["list_tables_in_schema"] = list_tables_tool;
             options.tools["get_schema_for_table"] = get_schema_tool;
             options.max_steps = 20; // Allow multi-step reasoning with tool calls
 
@@ -806,29 +811,29 @@ extern "C"
                     if (result.result.contains("success") && result.result["success"] == true)
                     {
                         // Format based on tool type
-                        if (result.tool_name == "list_databases" && result.result.contains("count"))
+                        if (result.tool_name == "list_schemas" && result.result.contains("count"))
                         {
                             int count = result.result["count"];
                             std::string preview;
-                            if (result.result.contains("databases") && result.result["databases"].is_array())
+                            if (result.result.contains("schemas") && result.result["schemas"].is_array())
                             {
-                                auto dbs = result.result["databases"];
-                                int show = std::min(5, (int)dbs.size());
+                                auto schemas = result.result["schemas"];
+                                int show = std::min(5, (int)schemas.size());
                                 for (int i = 0; i < show; i++)
                                 {
                                     if (i > 0)
                                         preview += " - ";
-                                    preview += dbs[i].get<std::string>();
+                                    preview += schemas[i].get<std::string>();
                                 }
-                                if (dbs.size() > 5)
+                                if (schemas.size() > 5)
                                     preview += "...";
                             }
-                            log_output << "  └─ Found " << count << " databases: " << preview << "\n";
+                            log_output << "  └─ Found " << count << " schemas: " << preview << "\n";
                         }
-                        else if (result.tool_name == "list_tables_in_database" && result.result.contains("count"))
+                        else if (result.tool_name == "list_tables_in_schema" && result.result.contains("count"))
                         {
                             int count = result.result["count"];
-                            std::string db = result.result.value("database", "");
+                            std::string schema = result.result.value("schema", "");
                             std::string preview;
                             if (result.result.contains("tables") && result.result["tables"].is_array())
                             {
@@ -843,7 +848,7 @@ extern "C"
                                 if (tables.size() > 5)
                                     preview += "...";
                             }
-                            log_output << "  └─ Found " << count << " tables in database '" << db << "': " << preview << "\n";
+                            log_output << "  └─ Found " << count << " tables in schema '" << schema << "': " << preview << "\n";
                         }
                         else if (result.tool_name == "get_schema_for_table" && result.result.contains("table"))
                         {
