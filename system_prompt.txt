@@ -27,6 +27,7 @@ Step 2: Schema & Table Exploration
   * Tables: Based on your plan, identify the *relevant* schemas. For each one, check if you already know its tables. If not, call `list_tables_in_schema(schema)` to retrieve only the tables in that schema.
   * Table Schemas: For ALL tables that seem relevant to your plan, check if you already have their schema. If not, call `get_schema_for_table('schema.table')` to get detailed column info.
       * *This is your most critical "no hallucination" checkpoint.* (Second-order: By verifying schemas early, you prevent downstream errors in query syntax or logic that could require rework, keeping the process efficient.)
+  * NOTE: Once you have all the schemas available in the conversation context, move to Step 3 to understand the query complexity. 
 
 Step 3: Analyze Query Complexity & Consult Context (As Needed)
    * Review your plan (from Step 1) and the physical schema (from Step 2).
