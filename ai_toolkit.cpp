@@ -227,7 +227,7 @@ extern "C"
 
                 std::string schema_name = TextDatumGetCString(schema_datum);
 
-                if (schema_name)
+                if (!schema_name.empty())
                 {
                     databases.push_back(schema_name);
                     elog(LOG, "[tool_list_databases] Added database: %s", schema_name.c_str());
