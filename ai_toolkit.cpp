@@ -439,8 +439,8 @@ extern "C"
             }
 
             // Properly handle memory
-            char *schema_cstr = TextDatumGetCString(schema_datum);
-            char *table_cstr = TextDatumGetCString(table_datum);
+            char *schema_cstr = SPI_getvalue(tuple, tupdesc, 1);
+            char *table_cstr = SPI_getvalue(tuple, tupdesc, 2);
 
             if (schema_cstr == NULL || table_cstr == NULL)
             {
@@ -545,9 +545,9 @@ extern "C"
             bool default_isnull = isnull;
 
             // Properly handle memory
-            char *col_name_cstr = TextDatumGetCString(col_name_datum);
-            char *col_type_cstr = TextDatumGetCString(col_type_datum);
-            char *col_nullable_cstr = TextDatumGetCString(col_nullable_datum);
+            char *col_name_cstr = SPI_getvalue(tuple, tupdesc, 1);
+            char *col_type_cstr = SPI_getvalue(tuple, tupdesc, 2);
+            char *col_nullable_cstr = SPI_getvalue(tuple, tupdesc, 4);
 
             if (!col_name_cstr || !col_type_cstr || !col_nullable_cstr)
             {
@@ -591,7 +591,7 @@ extern "C"
 
             if (!default_isnull)
             {
-                char *col_default_cstr = TextDatumGetCString(col_default_datum);
+                char *col_default_cstr = SPI_getvalue(tuple, tupdesc, 5);
                 if (col_default_cstr)
                 {
                     std::string col_default(col_default_cstr);
