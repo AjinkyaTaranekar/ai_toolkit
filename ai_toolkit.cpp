@@ -199,62 +199,122 @@ extern "C"
      */
     nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
-        elog(LOG, "[tool_list_databases] Starting execution");
+        elog(LOG, "[tool_list_databases] === START ===");
+
+        // Check SPI connection state
+        if (SPI_connect() == SPI_ERROR_CONNECT)
+        {
+            elog(WARNING, "[tool_list_databases] SPI already connected (expected in tool context)");
+        }
+        else
+        {
+            elog(LOG, "[tool_list_databases] SPI_connect successful");
+            SPI_finish();
+        }
 
         const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
 
-        elog(LOG, "[tool_list_databases] About to execute query");
+        elog(LOG, "[tool_list_databases] Executing query");
         int ret = SPI_execute(sql, true, 0);
-        elog(LOG, "[tool_list_databases] SPI_execute() returned: %d", ret);
+        elog(LOG, "[tool_list_databases] SPI_execute returned: %d (expected: %d)", ret, SPI_OK_SELECT);
 
         if (ret != SPI_OK_SELECT)
         {
-            elog(WARNING, "[tool_list_databases] Query execution failed with code: %d", ret);
-            return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
+            elog(ERROR, "[tool_list_databases] Query failed with code: %d", ret);
+            nlohmann::json error_result;
+            error_result["success"] = false;
+            error_result["error"] = "Failed to query databases";
+            elog(LOG, "[tool_list_databases] === END (ERROR) ===");
+            return error_result;
         }
 
-        elog(LOG, "[tool_list_databases] Query successful, processed %lu rows", (unsigned long)SPI_processed);
-        nlohmann::json databases = nlohmann::json::array();
+        uint64 row_count = SPI_processed;
+        elog(LOG, "[tool_list_databases] Processing %lu rows", (unsigned long)row_count);
 
-        for (uint64 i = 0; i < SPI_processed; i++)
+        // Use vector first, then convert to json at the end
+        std::vector<std::string> database_list;
+        database_list.reserve(row_count);
+
+        for (uint64 i = 0; i < row_count; i++)
         {
-            bool isnull;
+            elog(LOG, "[tool_list_databases] Processing row %lu/%lu", (unsigned long)(i + 1), (unsigned long)row_count);
+
+            bool isnull = false;
             HeapTuple tuple = SPI_tuptable->vals[i];
             TupleDesc tupdesc = SPI_tuptable->tupdesc;
 
+            elog(LOG, "[tool_list_databases] Getting binary value for row %lu", (unsigned long)i);
             Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
 
             if (isnull)
             {
-                elog(WARNING, "[tool_list_databases] Encountered NULL database name at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_databases] Row %lu has NULL database name, skipping", (unsigned long)i);
                 continue;
             }
 
-            // CRITICAL FIX: Properly get text and free memory
-            char *database_name_cstr = TextDatumGetCString(database_datum);
+            elog(LOG, "[tool_list_databases] Converting datum to text for row %lu", (unsigned long)i);
+
+            // Use SPI_getvalue instead of TextDatumGetCString - it's safer
+            char *database_name_cstr = SPI_getvalue(tuple, tupdesc, 1);
+
             if (database_name_cstr == NULL)
             {
-                elog(WARNING, "[tool_list_databases] TextDatumGetCString returned NULL at row %lu", (unsigned long)i);
+                elog(WARNING, "[tool_list_databases] SPI_getvalue returned NULL for row %lu", (unsigned long)i);
                 continue;
             }
 
-            // Copy to std::string immediately
-            std::string database_name(database_name_cstr);
+            elog(LOG, "[tool_list_databases] Row %lu database name C-string: '%s'", (unsigned long)i, database_name_cstr);
 
-            // CRITICAL: Free the allocated memory
+            // Create string and immediately free
+            std::string database_name(database_name_cstr);
+            elog(LOG, "[tool_list_databases] Row %lu database name std::string: '%s'", (unsigned long)i, database_name.c_str());
+
             pfree(database_name_cstr);
+            elog(LOG, "[tool_list_databases] Freed C-string for row %lu", (unsigned long)i);
 
             if (!database_name.empty())
             {
-                databases.push_back(database_name);
-                elog(LOG, "[tool_list_databases] Added database: %s", database_name.c_str());
+                database_list.push_back(database_name);
+                elog(LOG, "[tool_list_databases] Added database '%s' to list (total: %lu)",
+                     database_name.c_str(), (unsigned long)database_list.size());
+            }
+            else
+            {
+                elog(WARNING, "[tool_list_databases] Empty database name at row %lu", (unsigned long)i);
             }
         }
 
-        elog(LOG, "[tool_list_databases] Returning result with %lu databases", (unsigned long)databases.size());
-        return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
-    }
+        elog(LOG, "[tool_list_databases] Finished processing all rows, creating JSON response");
 
+        // Build JSON response carefully
+        nlohmann::json result;
+
+        elog(LOG, "[tool_list_databases] Setting success field");
+        result["success"] = true;
+
+        elog(LOG, "[tool_list_databases] Setting count field: %lu", (unsigned long)database_list.size());
+        result["count"] = database_list.size();
+
+        elog(LOG, "[tool_list_databases] Creating databases array");
+        nlohmann::json databases_array = nlohmann::json::array();
+
+        for (size_t i = 0; i < database_list.size(); i++)
+        {
+            elog(LOG, "[tool_list_databases] Adding database %lu/%lu to JSON: '%s'",
+                 (unsigned long)(i + 1), (unsigned long)database_list.size(), database_list[i].c_str());
+            databases_array.push_back(database_list[i]);
+        }
+
+        elog(LOG, "[tool_list_databases] Setting databases field");
+        result["databases"] = databases_array;
+
+        elog(LOG, "[tool_list_databases] JSON response created successfully");
+        elog(LOG, "[tool_list_databases] Response dump: %s", result.dump().c_str());
+        elog(LOG, "[tool_list_databases] === END (SUCCESS) ===");
+
+        return result;
+    }
+    
     /**
      * Tool function: List all tables in a specific database
      */
