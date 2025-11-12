@@ -200,60 +200,59 @@ extern "C"
     nlohmann::json tool_list_databases(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         elog(LOG, "[tool_list_databases] Starting execution");
-        try
+
+        const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
+
+        elog(LOG, "[tool_list_databases] About to execute query");
+        int ret = SPI_execute(sql, true, 0);
+        elog(LOG, "[tool_list_databases] SPI_execute() returned: %d", ret);
+
+        if (ret != SPI_OK_SELECT)
         {
-            const char *sql = "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname";
+            elog(WARNING, "[tool_list_databases] Query execution failed with code: %d", ret);
+            return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
+        }
 
-            elog(LOG, "[tool_list_databases] About to execute query (using existing SPI connection)");
-            int ret = SPI_execute(sql, true, 0);
-            elog(LOG, "[tool_list_databases] SPI_execute() returned: %d", ret);
+        elog(LOG, "[tool_list_databases] Query successful, processed %lu rows", (unsigned long)SPI_processed);
+        nlohmann::json databases = nlohmann::json::array();
 
-            if (ret != SPI_OK_SELECT)
+        for (uint64 i = 0; i < SPI_processed; i++)
+        {
+            bool isnull;
+            HeapTuple tuple = SPI_tuptable->vals[i];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+
+            Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+
+            if (isnull)
             {
-                elog(LOG, "[tool_list_databases] Query execution failed");
-                return nlohmann::json{{"success", false}, {"error", "Failed to query databases"}};
+                elog(WARNING, "[tool_list_databases] Encountered NULL database name at row %lu", (unsigned long)i);
+                continue;
             }
 
-            elog(LOG, "[tool_list_databases] Query successful, processed %lu rows", (unsigned long)SPI_processed);
-            nlohmann::json databases = nlohmann::json::array();
-
-            for (uint64 i = 0; i < SPI_processed; i++)
+            // CRITICAL FIX: Properly get text and free memory
+            char *database_name_cstr = TextDatumGetCString(database_datum);
+            if (database_name_cstr == NULL)
             {
-                bool isnull;
-                HeapTuple tuple = SPI_tuptable->vals[i];
-                TupleDesc tupdesc = SPI_tuptable->tupdesc;
-
-                Datum database_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-
-                if (isnull)
-                {
-                    elog(LOG, "[tool_list_databases] Encountered NULL database name");
-                    continue;
-                }
-
-                char *database_name_cstr = TextDatumGetCString(database_datum);
-                std::string database_name = database_name_cstr ? database_name_cstr : "";
-
-                if (!database_name.empty())
-                {
-                    databases.push_back(database_name);
-                    elog(LOG, "[tool_list_databases] Added database: %s", database_name.c_str());
-                }
+                elog(WARNING, "[tool_list_databases] TextDatumGetCString returned NULL at row %lu", (unsigned long)i);
+                continue;
             }
 
-            elog(LOG, "[tool_list_databases] Returning result");
-            return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
+            // Copy to std::string immediately
+            std::string database_name(database_name_cstr);
+
+            // CRITICAL: Free the allocated memory
+            pfree(database_name_cstr);
+
+            if (!database_name.empty())
+            {
+                databases.push_back(database_name);
+                elog(LOG, "[tool_list_databases] Added database: %s", database_name.c_str());
+            }
         }
-        catch (const std::exception &e)
-        {
-            elog(LOG, "[tool_list_databases] Caught std::exception: %s", e.what());
-            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
-        }
-        catch (...)
-        {
-            elog(LOG, "[tool_list_databases] Caught unknown exception");
-            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
-        }
+
+        elog(LOG, "[tool_list_databases] Returning result with %lu databases", (unsigned long)databases.size());
+        return nlohmann::json{{"success", true}, {"databases", databases}, {"count", databases.size()}};
     }
 
     /**
@@ -262,67 +261,80 @@ extern "C"
     nlohmann::json tool_list_tables_in_database(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         elog(LOG, "[tool_list_tables_in_database] Starting execution");
-        try
+
+        if (!params.contains("database"))
         {
-            if (!params.contains("database"))
+            elog(WARNING, "[tool_list_tables_in_database] Missing database parameter");
+            return nlohmann::json{{"success", false}, {"error", "Missing required parameter: database"}};
+        }
+
+        std::string database = params["database"].get<std::string>();
+        elog(LOG, "[tool_list_tables_in_database] Database parameter: %s", database.c_str());
+
+        std::string sql = "SELECT schemaname, tablename FROM pg_tables "
+                          "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
+                          "ORDER BY schemaname, tablename";
+
+        elog(LOG, "[tool_list_tables_in_database] About to execute query");
+        int ret = SPI_execute(sql.c_str(), true, 0);
+        elog(LOG, "[tool_list_tables_in_database] SPI_execute() returned: %d", ret);
+
+        if (ret != SPI_OK_SELECT)
+        {
+            elog(WARNING, "[tool_list_tables_in_database] Query execution failed with code: %d", ret);
+            return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
+        }
+
+        elog(LOG, "[tool_list_tables_in_database] Query successful, processed %lu rows", (unsigned long)SPI_processed);
+        nlohmann::json tables = nlohmann::json::array();
+
+        for (uint64 i = 0; i < SPI_processed; i++)
+        {
+            bool isnull_schema, isnull_table;
+            HeapTuple tuple = SPI_tuptable->vals[i];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+
+            Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull_schema);
+            Datum table_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull_table);
+
+            if (isnull_schema || isnull_table)
             {
-                elog(LOG, "[tool_list_tables_in_database] Missing database parameter");
-                return nlohmann::json{{"success", false}, {"error", "Missing required parameter: database"}};
+                elog(WARNING, "[tool_list_tables_in_database] NULL schema or table at row %lu", (unsigned long)i);
+                continue;
             }
 
-            std::string database = params["database"].get<std::string>();
-            elog(LOG, "[tool_list_tables_in_database] Database parameter: %s", database.c_str());
+            // CRITICAL FIX: Properly handle memory
+            char *schema_cstr = TextDatumGetCString(schema_datum);
+            char *table_cstr = TextDatumGetCString(table_datum);
 
-            // Query to get all tables in the current database
-            std::string sql = "SELECT schemaname, tablename FROM pg_tables "
-                              "WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') "
-                              "ORDER BY schemaname, tablename";
-
-            elog(LOG, "[tool_list_tables_in_database] About to execute query (using existing SPI connection)");
-            int ret = SPI_execute(sql.c_str(), true, 0);
-            elog(LOG, "[tool_list_tables_in_database] SPI_execute() returned: %d", ret);
-
-            if (ret != SPI_OK_SELECT)
+            if (schema_cstr == NULL || table_cstr == NULL)
             {
-                elog(LOG, "[tool_list_tables_in_database] Query execution failed");
-                return nlohmann::json{{"success", false}, {"error", "Failed to query tables"}};
+                elog(WARNING, "[tool_list_tables_in_database] TextDatumGetCString returned NULL at row %lu", (unsigned long)i);
+                if (schema_cstr)
+                    pfree(schema_cstr);
+                if (table_cstr)
+                    pfree(table_cstr);
+                continue;
             }
 
-            elog(LOG, "[tool_list_tables_in_database] Query successful, processed %lu rows", (unsigned long)SPI_processed);
-            nlohmann::json tables = nlohmann::json::array();
+            // Copy to std::string
+            std::string schema_str(schema_cstr);
+            std::string table_str(table_cstr);
 
-            for (uint64 i = 0; i < SPI_processed; i++)
+            // CRITICAL: Free memory
+            pfree(schema_cstr);
+            pfree(table_cstr);
+
+            if (!schema_str.empty() && !table_str.empty())
             {
-                bool isnull;
-                HeapTuple tuple = SPI_tuptable->vals[i];
-                TupleDesc tupdesc = SPI_tuptable->tupdesc;
-
-                Datum schema_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-                Datum table_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
-
-                std::string schema_str = TextDatumGetCString(schema_datum);
-                std::string table_str = TextDatumGetCString(table_datum);
-                if (!schema_str.empty() && !table_str.empty())
-                {
-                    std::string full_name = schema_str + "." + table_str;
-                    tables.push_back(full_name);
-                    elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
-                }
+                std::string full_name = schema_str + "." + table_str;
+                tables.push_back(full_name);
+                elog(LOG, "[tool_list_tables_in_database] Added table: %s", full_name.c_str());
             }
+        }
 
-            elog(LOG, "[tool_list_tables_in_database] Returning result");
-            return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
-        }
-        catch (const std::exception &e)
-        {
-            elog(LOG, "[tool_list_tables_in_database] Caught std::exception: %s", e.what());
-            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
-        }
-        catch (...)
-        {
-            elog(LOG, "[tool_list_tables_in_database] Caught unknown exception");
-            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
-        }
+        elog(LOG, "[tool_list_tables_in_database] Returning result with %lu tables", (unsigned long)tables.size());
+        return nlohmann::json{{"success", true}, {"database", database}, {"tables", tables}, {"count", tables.size()}};
     }
 
     /**
@@ -331,134 +343,153 @@ extern "C"
     nlohmann::json tool_get_schema_for_table(const nlohmann::json &params, const ai::ToolExecutionContext &context)
     {
         elog(LOG, "[tool_get_schema_for_table] Starting execution");
-        try
+
+        if (!params.contains("table_name"))
         {
-            if (!params.contains("table_name"))
+            elog(WARNING, "[tool_get_schema_for_table] Missing table_name parameter");
+            return nlohmann::json{{"success", false}, {"error", "Missing required parameter: table_name"}};
+        }
+
+        std::string table_name = params["table_name"].get<std::string>();
+        std::string schema_name = "public";
+
+        // Parse schema.table if provided
+        size_t dot_pos = table_name.find('.');
+        if (dot_pos != std::string::npos)
+        {
+            schema_name = table_name.substr(0, dot_pos);
+            table_name = table_name.substr(dot_pos + 1);
+        }
+
+        elog(LOG, "[tool_get_schema_for_table] Schema: %s, Table: %s", schema_name.c_str(), table_name.c_str());
+
+        std::string columns_sql =
+            "SELECT column_name, data_type, character_maximum_length, "
+            "is_nullable, column_default "
+            "FROM information_schema.columns "
+            "WHERE table_schema = $1 AND table_name = $2 "
+            "ORDER BY ordinal_position";
+
+        elog(LOG, "[tool_get_schema_for_table] About to execute query with args");
+        Datum values[2];
+        char nulls[2] = {' ', ' '};
+        values[0] = CStringGetTextDatum(schema_name.c_str());
+        values[1] = CStringGetTextDatum(table_name.c_str());
+        Oid argtypes[2] = {TEXTOID, TEXTOID};
+
+        int ret = SPI_execute_with_args(columns_sql.c_str(), 2, argtypes, values, nulls, true, 0);
+        elog(LOG, "[tool_get_schema_for_table] SPI_execute_with_args() returned: %d, processed: %lu",
+             ret, (unsigned long)SPI_processed);
+
+        if (ret != SPI_OK_SELECT || SPI_processed == 0)
+        {
+            elog(WARNING, "[tool_get_schema_for_table] Table not found or query failed");
+            return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
+        }
+
+        std::stringstream create_sql;
+        create_sql << "CREATE TABLE " << schema_name << "." << table_name << " (\n";
+
+        nlohmann::json columns = nlohmann::json::array();
+
+        for (uint64 i = 0; i < SPI_processed; i++)
+        {
+            bool isnull;
+            HeapTuple tuple = SPI_tuptable->vals[i];
+            TupleDesc tupdesc = SPI_tuptable->tupdesc;
+
+            // Get all column attributes
+            Datum col_name_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
+            if (isnull)
+                continue;
+
+            Datum col_type_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
+            if (isnull)
+                continue;
+
+            Datum col_maxlen_datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
+            bool maxlen_isnull = isnull;
+
+            Datum col_nullable_datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
+            if (isnull)
+                continue;
+
+            Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
+            bool default_isnull = isnull;
+
+            // CRITICAL FIX: Proper memory handling
+            char *col_name_cstr = TextDatumGetCString(col_name_datum);
+            char *col_type_cstr = TextDatumGetCString(col_type_datum);
+            char *col_nullable_cstr = TextDatumGetCString(col_nullable_datum);
+
+            if (!col_name_cstr || !col_type_cstr || !col_nullable_cstr)
             {
-                elog(LOG, "[tool_get_schema_for_table] Missing table_name parameter");
-                return nlohmann::json{{"success", false}, {"error", "Missing required parameter: table_name"}};
+                elog(WARNING, "[tool_get_schema_for_table] NULL pointer from TextDatumGetCString at row %lu", (unsigned long)i);
+                if (col_name_cstr)
+                    pfree(col_name_cstr);
+                if (col_type_cstr)
+                    pfree(col_type_cstr);
+                if (col_nullable_cstr)
+                    pfree(col_nullable_cstr);
+                continue;
             }
 
-            std::string table_name = params["table_name"].get<std::string>();
-            std::string schema_name = "public";
+            // Copy to std::string
+            std::string col_name(col_name_cstr);
+            std::string col_type(col_type_cstr);
+            std::string col_nullable(col_nullable_cstr);
 
-            // Parse schema.table if provided
-            size_t dot_pos = table_name.find('.');
-            if (dot_pos != std::string::npos)
+            // Free immediately after copying
+            pfree(col_name_cstr);
+            pfree(col_type_cstr);
+            pfree(col_nullable_cstr);
+
+            nlohmann::json col_info;
+            col_info["name"] = col_name;
+            col_info["type"] = col_type;
+            col_info["nullable"] = (col_nullable == "YES");
+
+            create_sql << "  " << col_name << " " << col_type;
+
+            if (!maxlen_isnull && col_type == "character varying")
             {
-                schema_name = table_name.substr(0, dot_pos);
-                table_name = table_name.substr(dot_pos + 1);
+                int maxlen = DatumGetInt32(col_maxlen_datum);
+                create_sql << "(" << maxlen << ")";
             }
 
-            elog(LOG, "[tool_get_schema_for_table] Schema: %s, Table: %s", schema_name.c_str(), table_name.c_str());
-
-            // Get table columns
-            std::string columns_sql =
-                "SELECT column_name, data_type, character_maximum_length, "
-                "is_nullable, column_default "
-                "FROM information_schema.columns "
-                "WHERE table_schema = $1 AND table_name = $2 "
-                "ORDER BY ordinal_position";
-
-            elog(LOG, "[tool_get_schema_for_table] About to execute query with args (using existing SPI connection)");
-            Datum values[2];
-            char nulls[2] = {' ', ' '};
-            values[0] = CStringGetTextDatum(schema_name.c_str());
-            values[1] = CStringGetTextDatum(table_name.c_str());
-            Oid argtypes[2] = {TEXTOID, TEXTOID};
-
-            int ret = SPI_execute_with_args(columns_sql.c_str(), 2, argtypes, values, nulls, true, 0);
-            elog(LOG, "[tool_get_schema_for_table] SPI_execute_with_args() returned: %d, processed: %lu", ret, (unsigned long)SPI_processed);
-
-            if (ret != SPI_OK_SELECT || SPI_processed == 0)
+            if (col_nullable == "NO")
             {
-                elog(LOG, "[tool_get_schema_for_table] Table not found or query failed");
-                return nlohmann::json{{"success", false}, {"error", "Table not found or no columns"}};
+                create_sql << " NOT NULL";
             }
 
-            // Build CREATE TABLE statement
-            std::stringstream create_sql;
-            create_sql << "CREATE TABLE " << schema_name << "." << table_name << " (\n";
-
-            nlohmann::json columns = nlohmann::json::array();
-
-            for (uint64 i = 0; i < SPI_processed; i++)
+            if (!default_isnull)
             {
-                bool isnull;
-                HeapTuple tuple = SPI_tuptable->vals[i];
-                TupleDesc tupdesc = SPI_tuptable->tupdesc;
-
-                Datum col_name_datum = SPI_getbinval(tuple, tupdesc, 1, &isnull);
-                Datum col_type_datum = SPI_getbinval(tuple, tupdesc, 2, &isnull);
-                Datum col_maxlen_datum = SPI_getbinval(tuple, tupdesc, 3, &isnull);
-                bool maxlen_isnull = isnull;
-                Datum col_nullable_datum = SPI_getbinval(tuple, tupdesc, 4, &isnull);
-                Datum col_default_datum = SPI_getbinval(tuple, tupdesc, 5, &isnull);
-                bool default_isnull = isnull;
-
-                std::string col_name = TextDatumGetCString(col_name_datum);
-                std::string col_type = TextDatumGetCString(col_type_datum);
-                std::string col_nullable = TextDatumGetCString(col_nullable_datum);
-
-                if (!col_name.empty() && !col_type.empty() && !col_nullable.empty())
+                char *col_default_cstr = TextDatumGetCString(col_default_datum);
+                if (col_default_cstr)
                 {
+                    std::string col_default(col_default_cstr);
+                    pfree(col_default_cstr); // CRITICAL: Free memory
 
-                    nlohmann::json col_info;
-                    col_info["name"] = col_name;
-                    col_info["type"] = col_type;
-                    col_info["nullable"] = (col_nullable == "YES");
-
-                    create_sql << "  " << col_name << " " << col_type;
-
-                    if (!maxlen_isnull && col_type == "character varying")
-                    {
-                        int maxlen = DatumGetInt32(col_maxlen_datum);
-                        create_sql << "(" << maxlen << ")";
-                    }
-
-                    if (col_nullable == "NO")
-                    {
-                        create_sql << " NOT NULL";
-                    }
-
-                    if (!default_isnull)
-                    {
-                        char *col_default_str = TextDatumGetCString(col_default_datum);
-                        if (col_default_str)
-                        {
-                            std::string col_default(col_default_str);
-                            create_sql << " DEFAULT " << col_default;
-                            col_info["default"] = col_default;
-                        }
-                    }
-
-                    if (i < SPI_processed - 1)
-                    {
-                        create_sql << ",\n";
-                    }
-                    columns.push_back(col_info);
+                    create_sql << " DEFAULT " << col_default;
+                    col_info["default"] = col_default;
                 }
             }
 
-            create_sql << "\n);";
+            if (i < SPI_processed - 1)
+            {
+                create_sql << ",\n";
+            }
+            columns.push_back(col_info);
+        }
 
-            elog(LOG, "[tool_get_schema_for_table] Schema generation complete, returning result");
-            return nlohmann::json{
-                {"success", true},
-                {"table", schema_name + "." + table_name},
-                {"create_statement", create_sql.str()},
-                {"columns", columns}};
-        }
-        catch (const std::exception &e)
-        {
-            elog(LOG, "[tool_get_schema_for_table] Caught std::exception: %s", e.what());
-            return nlohmann::json{{"success", false}, {"error", std::string("Exception: ") + e.what()}};
-        }
-        catch (...)
-        {
-            elog(LOG, "[tool_get_schema_for_table] Caught unknown exception");
-            return nlohmann::json{{"success", false}, {"error", "Unknown exception"}};
-        }
+        create_sql << "\n);";
+
+        elog(LOG, "[tool_get_schema_for_table] Schema generation complete, returning result");
+        return nlohmann::json{
+            {"success", true},
+            {"table", schema_name + "." + table_name},
+            {"create_statement", create_sql.str()},
+            {"columns", columns}};
     }
 
     PG_FUNCTION_INFO_V1(help);
