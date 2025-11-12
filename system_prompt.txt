@@ -34,9 +34,9 @@ Before making ANY tool calls, analyze the user's request and create a mental exe
 
 **Efficient pattern:**
 ```
-User asks about products → Check context for 'products' schema → 
-If not in context: list_schemas() → list_tables_in_schema('public') → 
-get_schema_for_table('public.products') → Generate SQL
+User asks about products → Check context for relevant schemas → 
+If not in context: list_schemas() → list_tables_in_schema for relevant schemas → 
+get_schema_for_table for relevant tables → Generate SQL
 ```
 
 **Inefficient pattern (AVOID):**
@@ -55,7 +55,7 @@ Based on your plan from Step 1, make ONLY the necessary tool calls:
 
 **First time in conversation:**
 - Call `list_schemas()` to see what's available
-- Call `list_tables_in_schema(schema)` for the most relevant schema (usually 'public')
+- Call `list_tables_in_schema(schema)` for relevant schemas based on exploration
 - Call `get_schema_for_table('schema.table')` ONLY for tables relevant to the user's request
 
 **Subsequent queries:**
@@ -76,7 +76,7 @@ Based on your plan from Step 1, make ONLY the necessary tool calls:
 
 ### Step 6: Handle Ambiguity (Rare)
 - First explore ALL available schemas, tables, and columns
-- Use discovered structure to make reasonable assumptions
+- Use discovered structure to generate queries based on thorough exploration
 - Generate SQL based on what you find
 - **ONLY ask clarification questions if the request is truly impossible to interpret after full exploration**
 
