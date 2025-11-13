@@ -5,6 +5,8 @@
 #include <optional>
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
+#include <vector>
 
 #include <ai/ai.h>
 #include <ai/logger.h>
@@ -637,7 +639,10 @@ extern "C"
             "  • ai_toolkit.query(text)  \n"
             "      Generate SQL from natural language with AI assistance\n"
             "      Uses memory system and asks for approval before execution\n"
-            "      Example: SELECT ai_toolkit.query('show active users');\n\n"
+            "      Supports SELECT, DDL (CREATE/ALTER/DROP), and DML (INSERT/UPDATE/DELETE)\n"
+            "      ⚠️  DDL/DML queries are generated with disclaimers and NOT executed\n"
+            "      Example: SELECT ai_toolkit.query('show active users');\n"
+            "      Example: SELECT ai_toolkit.query('create a users table');\n\n"
             "  • ai_toolkit.set_memory(category, key, value, notes)\n"
             "      Store contextual information about database schema\n"
             "      Example: SELECT ai_toolkit.set_memory(\n"
@@ -657,6 +662,9 @@ extern "C"
             "  calculation, permission, custom\n\n"
             "💡 TIP: The AI can autonomously use set_memory and get_memory\n"
             "    during query generation to learn and improve over time!\n\n"
+            "⚠️  IMPORTANT: DDL and DML queries are generated for reference only.\n"
+            "    They are displayed with a disclaimer and NOT executed automatically.\n"
+            "    Always review such queries carefully before manual execution.\n\n"
             "For full documentation, visit: github.com/your-repo/ai-toolkit\n"
             "═══════════════════════════════════════════════════════════════════\n";
 
@@ -814,10 +822,13 @@ extern "C"
             std::string system_prompt = load_system_prompt();
 
             user_prompt = "User request: `" + user_prompt + "`\n"
-                                                            "Generate a valid Postgres SELECT query based on the request. "
+                                                            "Generate a valid Postgres query based on the request. "
                                                             "Follow the strict step-by-step process in the system prompt. "
                                                             "Use the available tools to explore the database schema and retrieve necessary information. "
-                                                            "Only generate SELECT queries. Never modify data.";
+                                                            "Only 10 Tools Calls are available use them very wisely, if you really don't have information then only call, do not spam it."
+                                                            "If the query involves DDL (CREATE, ALTER, DROP) or DML (INSERT, UPDATE, DELETE), "
+                                                            "you MUST include a <disclaimer> tag at the beginning of your response with a warning message, "
+                                                            "followed by the SQL query in <sql> tags. The query will NOT be executed, only shown to the user.";
 
             // Configure generation options with tools
             ai::GenerateOptions options(model, system_prompt, user_prompt);
@@ -826,7 +837,7 @@ extern "C"
             options.tools["list_schemas"] = list_schemas_tool;
             options.tools["list_tables_in_schema"] = list_tables_tool;
             options.tools["get_schema_for_table"] = get_schema_tool;
-            options.max_steps = 20; // Allow multi-step reasoning with tool calls
+            options.max_steps = 10; // Allow multi-step reasoning with tool calls
 
             // Add callbacks for intermediate logging
             std::stringstream log_output;
@@ -964,9 +975,31 @@ extern "C"
 
             if (result)
             {
-                // Parse SQL query from response
+                // Parse SQL query and disclaimer from response
                 std::string response_text = result.text;
                 std::string sql_query;
+                std::string disclaimer;
+                bool has_disclaimer = false;
+
+                // Look for <disclaimer> ... </disclaimer> pattern
+                size_t disclaimer_start = response_text.find("<disclaimer>");
+                if (disclaimer_start != std::string::npos)
+                {
+                    disclaimer_start += 12; // Move past "<disclaimer>"
+                    size_t disclaimer_end = response_text.find("</disclaimer>", disclaimer_start);
+                    if (disclaimer_end != std::string::npos)
+                    {
+                        disclaimer = response_text.substr(disclaimer_start, disclaimer_end - disclaimer_start);
+                        // Trim whitespace
+                        size_t first = disclaimer.find_first_not_of(" \n\r\t");
+                        size_t last = disclaimer.find_last_not_of(" \n\r\t");
+                        if (first != std::string::npos && last != std::string::npos)
+                        {
+                            disclaimer = disclaimer.substr(first, last - first + 1);
+                        }
+                        has_disclaimer = true;
+                    }
+                }
 
                 // Look for <sql> ... </sql> pattern
                 size_t sql_start = response_text.find("<sql>");
@@ -989,10 +1022,69 @@ extern "C"
 
                 if (!sql_query.empty())
                 {
-                    // Execute the SQL query
-                    elog(NOTICE, "\n📋 Generated Query:\n%s\n", sql_query.c_str());
+                    // Check if query is DDL or DML by examining the first keyword
+                    std::string query_upper = sql_query;
+                    std::transform(query_upper.begin(), query_upper.end(), query_upper.begin(), ::toupper);
 
-                    // SPI is already connected from the beginning of the function
+                    // Remove leading whitespace and comments
+                    size_t first_non_space = query_upper.find_first_not_of(" \n\r\t");
+                    if (first_non_space != std::string::npos)
+                    {
+                        query_upper = query_upper.substr(first_non_space);
+                    }
+
+                    // List of DDL and DML keywords
+                    bool is_ddl_dml = false;
+                    std::vector<std::string> ddl_dml_keywords = {
+                        "CREATE", "ALTER", "DROP", "TRUNCATE", "RENAME",
+                        "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE",
+                        "GRANT", "REVOKE"};
+
+                    for (const auto &keyword : ddl_dml_keywords)
+                    {
+                        if (query_upper.find(keyword) == 0 ||
+                            query_upper.find(keyword + " ") == 0 ||
+                            query_upper.find(keyword + "\n") == 0 ||
+                            query_upper.find(keyword + "\t") == 0)
+                        {
+                            is_ddl_dml = true;
+                            break;
+                        }
+                    }
+
+                    // If it's DDL/DML (either has disclaimer or detected by keywords), don't execute
+                    if (has_disclaimer || is_ddl_dml)
+                    {
+                        std::stringstream output;
+                        output << "\n⚠️  DISCLAIMER ⚠️\n";
+                        output << "═══════════════════════════════════════════════════════════\n";
+
+                        if (has_disclaimer && !disclaimer.empty())
+                        {
+                            output << disclaimer << "\n";
+                        }
+                        else
+                        {
+                            output << "This query involves data modification or schema changes.\n";
+                            output << "It is generated for reference only and should not be executed\n";
+                            output << "without proper review and backups.\n";
+                        }
+
+                        output << "═══════════════════════════════════════════════════════════\n\n";
+                        output << "📋 Generated Query (NOT EXECUTED):\n";
+                        output << "───────────────────────────────────────────────────────────\n";
+                        output << sql_query << "\n";
+                        output << "───────────────────────────────────────────────────────────\n";
+                        output << "\nℹ️  This query was generated for reference only and has NOT been executed.\n";
+                        output << "   Please review carefully before running it manually.\n";
+
+                        elog(NOTICE, "%s", output.str().c_str());
+                        SPI_finish();
+                        PG_RETURN_VOID();
+                    }
+
+                    // Execute the SQL query (only for SELECT and other safe queries)
+                    elog(NOTICE, "\n📋 Generated Query:\n%s\n", sql_query.c_str()); // SPI is already connected from the beginning of the function
                     int ret = SPI_execute(sql_query.c_str(), true, 0);
 
                     if (ret < 0)
