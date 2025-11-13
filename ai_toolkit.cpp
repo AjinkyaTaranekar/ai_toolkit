@@ -21,11 +21,7 @@ extern "C"
 #include "utils/guc.h"
 #include <executor/spi.h>
 #include <catalog/pg_type_d.h>
-#include <tcop/utility.h>
 #include <utils/elog.h>
-#include <nodes/parsenodes.h>
-#include <executor/executor.h>
-#include <tcop/tcopprot.h>
 
 #ifdef PG_MODULE_MAGIC
     PG_MODULE_MAGIC;
@@ -36,15 +32,6 @@ extern "C"
     static char *openrouter_model = nullptr;
     static char *openrouter_base_url = nullptr;
     static char *prompt_file_path = nullptr;
-
-    // Session-level tracking for queries and errors
-    static std::string last_query_text;
-    static std::string last_error_text;
-
-    // Hook variables
-    static ExecutorStart_hook_type prev_ExecutorStart = nullptr;
-    static emit_log_hook_type prev_emit_log_hook = nullptr;
-    static ProcessUtility_hook_type prev_ProcessUtility = nullptr;
 
     /**
      * Core function to set memory in database
@@ -1232,60 +1219,23 @@ extern "C"
                          errmsg("ai_toolkit.openrouter_api_key not set")));
             }
 
-            std::string query_to_explain;
-
-            // Check if query argument is provided
+            // Query parameter is now required
             if (PG_ARGISNULL(0))
             {
-                // No argument provided, use last query from session
-                if (last_query_text.empty())
-                {
-                    // Try to retrieve from memory table as fallback
-                    if (SPI_connect() != SPI_OK_CONNECT)
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                                 errmsg("Failed to connect to SPI")));
-                    }
-
-                    std::string error_msg;
-                    auto last_query = memory_get_core("session", "last_query", &error_msg, false);
-
-                    if (!last_query.has_value())
-                    {
-                        SPI_finish();
-                        ereport(ERROR,
-                                (errcode(ERRCODE_NO_DATA),
-                                 errmsg("No query to explain. Either provide a query or execute a query first.")));
-                    }
-
-                    query_to_explain = last_query.value();
-                    SPI_finish();
-                }
-                else
-                {
-                    query_to_explain = last_query_text;
-                }
-
-                if (SPI_connect() != SPI_OK_CONNECT)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                             errmsg("Failed to connect to SPI")));
-                }
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("Query parameter is required. Usage: SELECT ai_toolkit.explain_query('your query here');")));
             }
-            else
-            {
-                // Use provided query
-                text *query_text = PG_GETARG_TEXT_PP(0);
-                query_to_explain = std::string(VARDATA_ANY(query_text), VARSIZE_ANY_EXHDR(query_text));
 
-                if (SPI_connect() != SPI_OK_CONNECT)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                             errmsg("Failed to connect to SPI")));
-                }
+            // Get the query from the parameter
+            text *query_text = PG_GETARG_TEXT_PP(0);
+            std::string query_to_explain = std::string(VARDATA_ANY(query_text), VARSIZE_ANY_EXHDR(query_text));
+
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                         errmsg("Failed to connect to SPI")));
             }
 
             std::string api_key(openrouter_api_key);
@@ -1398,60 +1348,23 @@ extern "C"
                          errmsg("ai_toolkit.openrouter_api_key not set")));
             }
 
-            std::string error_to_explain;
-
-            // Check if error argument is provided
+            // Error parameter is now required
             if (PG_ARGISNULL(0))
             {
-                // No argument provided, use last error from session
-                if (last_error_text.empty())
-                {
-                    // Try to retrieve from memory table as fallback
-                    if (SPI_connect() != SPI_OK_CONNECT)
-                    {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                                 errmsg("Failed to connect to SPI")));
-                    }
-
-                    std::string error_msg;
-                    auto last_error = memory_get_core("session", "last_error", &error_msg, false);
-
-                    if (!last_error.has_value())
-                    {
-                        SPI_finish();
-                        ereport(ERROR,
-                                (errcode(ERRCODE_NO_DATA),
-                                 errmsg("No error to explain. Either provide an error message or encounter an error first.")));
-                    }
-
-                    error_to_explain = last_error.value();
-                    SPI_finish();
-                }
-                else
-                {
-                    error_to_explain = last_error_text;
-                }
-
-                if (SPI_connect() != SPI_OK_CONNECT)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                             errmsg("Failed to connect to SPI")));
-                }
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("Error message parameter is required. Usage: SELECT ai_toolkit.explain_error('your error message here');")));
             }
-            else
-            {
-                // Use provided error
-                text *error_text = PG_GETARG_TEXT_PP(0);
-                error_to_explain = std::string(VARDATA_ANY(error_text), VARSIZE_ANY_EXHDR(error_text));
 
-                if (SPI_connect() != SPI_OK_CONNECT)
-                {
-                    ereport(ERROR,
-                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-                             errmsg("Failed to connect to SPI")));
-                }
+            // Get the error from the parameter
+            text *error_text = PG_GETARG_TEXT_PP(0);
+            std::string error_to_explain = std::string(VARDATA_ANY(error_text), VARSIZE_ANY_EXHDR(error_text));
+
+            if (SPI_connect() != SPI_OK_CONNECT)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                         errmsg("Failed to connect to SPI")));
             }
 
             std::string api_key(openrouter_api_key);
@@ -1552,140 +1465,6 @@ extern "C"
 
 extern "C"
 {
-    /**
-     * Hook to capture query execution
-     * This captures SELECT, INSERT, UPDATE, DELETE queries
-     */
-    static void ai_toolkit_ExecutorStart(QueryDesc *queryDesc, int eflags)
-    {
-        // Capture the query string if available
-        if (queryDesc && queryDesc->sourceText)
-        {
-            try
-            {
-                last_query_text = std::string(queryDesc->sourceText);
-
-                // Also store in memory table for persistence across connections
-                if (SPI_connect() == SPI_OK_CONNECT)
-                {
-                    memory_set_core("session", "last_query", last_query_text,
-                                    "Last executed query in session", nullptr, false);
-                    SPI_finish();
-                }
-            }
-            catch (...)
-            {
-                // Silently ignore errors in query tracking
-            }
-        }
-
-        // Call the previous hook if it exists
-        if (prev_ExecutorStart)
-            prev_ExecutorStart(queryDesc, eflags);
-        else
-            standard_ExecutorStart(queryDesc, eflags);
-    }
-
-    /**
-     * Hook to capture utility commands (DDL, etc.)
-     * This captures CREATE, ALTER, DROP, GRANT, etc.
-     */
-    static void ai_toolkit_ProcessUtility(PlannedStmt *pstmt,
-                                          const char *queryString,
-                                          bool readOnlyTree,
-                                          ProcessUtilityContext context,
-                                          ParamListInfo params,
-                                          QueryEnvironment *queryEnv,
-                                          DestReceiver *dest,
-                                          QueryCompletion *qc)
-    {
-        // Capture the query string
-        if (queryString)
-        {
-            try
-            {
-                last_query_text = std::string(queryString);
-
-                // Also store in memory table
-                if (SPI_connect() == SPI_OK_CONNECT)
-                {
-                    memory_set_core("session", "last_query", last_query_text,
-                                    "Last executed query in session", nullptr, false);
-                    SPI_finish();
-                }
-            }
-            catch (...)
-            {
-                // Silently ignore errors in query tracking
-            }
-        }
-
-        // Call the previous hook if it exists
-        if (prev_ProcessUtility)
-            prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-                                params, queryEnv, dest, qc);
-        else
-            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-                                    params, queryEnv, dest, qc);
-    }
-
-    /**
-     * Hook to capture error messages
-     * This captures all ERROR and FATAL log messages
-     */
-    static void ai_toolkit_emit_log(ErrorData *edata)
-    {
-        // Only capture ERROR and FATAL messages
-        if (edata && (edata->elevel == ERROR || edata->elevel == FATAL))
-        {
-            try
-            {
-                std::stringstream error_stream;
-
-                // Build comprehensive error message
-                if (edata->message)
-                {
-                    error_stream << "ERROR: " << edata->message;
-                }
-
-                if (edata->detail)
-                {
-                    error_stream << "\nDETAIL: " << edata->detail;
-                }
-
-                if (edata->hint)
-                {
-                    error_stream << "\nHINT: " << edata->hint;
-                }
-
-                if (edata->context)
-                {
-                    error_stream << "\nCONTEXT: " << edata->context;
-                }
-
-                // Add query context if available
-                if (!last_query_text.empty())
-                {
-                    error_stream << "\nQUERY: " << last_query_text;
-                }
-
-                last_error_text = error_stream.str();
-
-                // Store in memory table (attempt, but don't fail if it doesn't work)
-                // Note: We can't use SPI here as we're in an error context
-                // So we only store in the static variable
-            }
-            catch (...)
-            {
-                // Silently ignore errors in error tracking
-            }
-        }
-
-        // Call the previous hook if it exists
-        if (prev_emit_log_hook)
-            prev_emit_log_hook(edata);
-    }
-
     void _PG_init(void)
     {
         DefineCustomStringVariable("ai_toolkit.openrouter_api_key",
@@ -1734,26 +1513,11 @@ extern "C"
                                    nullptr,
                                    nullptr);
 
-        // Install hooks to track all queries and errors in the session
-        prev_ExecutorStart = ExecutorStart_hook;
-        ExecutorStart_hook = ai_toolkit_ExecutorStart;
-
-        prev_ProcessUtility = ProcessUtility_hook;
-        ProcessUtility_hook = ai_toolkit_ProcessUtility;
-
-        prev_emit_log_hook = emit_log_hook;
-        emit_log_hook = ai_toolkit_emit_log;
-
-        ereport(LOG, (errmsg("ai_toolkit extension loaded with query/error tracking")));
+        ereport(LOG, (errmsg("ai_toolkit extension loaded")));
     }
 
     void _PG_fini(void)
     {
-        // Restore previous hooks
-        ExecutorStart_hook = prev_ExecutorStart;
-        ProcessUtility_hook = prev_ProcessUtility;
-        emit_log_hook = prev_emit_log_hook;
-
         ereport(LOG, (errmsg("ai_toolkit extension unloaded")));
     }
 }

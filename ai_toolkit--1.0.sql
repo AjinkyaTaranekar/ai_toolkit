@@ -23,26 +23,6 @@ CREATE TABLE ai_toolkit.ai_memory (
 
 CREATE INDEX idx_ai_memory_category_key ON ai_toolkit.ai_memory(category, key);
 
--- Query log: audit trail of all AI operations
-CREATE TABLE ai_toolkit.ai_query_log (
-    id SERIAL PRIMARY KEY,
-    session_id TEXT,
-    function_name TEXT NOT NULL,
-    user_prompt TEXT,
-    ai_analysis TEXT,
-    sql_generated TEXT,
-    user_approved BOOLEAN,
-    execution_result TEXT,
-    execution_time_ms INTEGER,
-    tokens_used INTEGER,
-    status TEXT,
-    error_message TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    created_by TEXT DEFAULT CURRENT_USER
-);
-
-CREATE INDEX idx_ai_query_log_created_at ON ai_toolkit.ai_query_log(created_at);
-
 -- ==========================================
 -- Core C Functions
 -- ==========================================
@@ -104,32 +84,12 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- View recent query logs
-CREATE OR REPLACE FUNCTION ai_toolkit.view_logs(limit_rows INTEGER DEFAULT 50)
-RETURNS TABLE(
-    id INTEGER,
-    function_name TEXT,
-    user_prompt TEXT,
-    sql_generated TEXT,
-    status TEXT,
-    created_at TIMESTAMP
-) AS $$
-BEGIN
-    RETURN QUERY SELECT l.id, l.function_name, l.user_prompt, l.sql_generated, l.status, l.created_at
-    FROM ai_toolkit.ai_query_log l 
-    ORDER BY l.created_at DESC 
-    LIMIT limit_rows;
-END;
-$$ LANGUAGE plpgsql;
-
 -- ==========================================
 -- Permissions
 -- ==========================================
 
 GRANT SELECT, INSERT, UPDATE ON ai_toolkit.ai_memory TO PUBLIC;
-GRANT SELECT, INSERT ON ai_toolkit.ai_query_log TO PUBLIC;
 GRANT USAGE ON SEQUENCE ai_toolkit.ai_memory_id_seq TO PUBLIC;
-GRANT USAGE ON SEQUENCE ai_toolkit.ai_query_log_id_seq TO PUBLIC;
 
 GRANT EXECUTE ON FUNCTION ai_toolkit.help() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.set_memory(text, text, text, text) TO PUBLIC;
