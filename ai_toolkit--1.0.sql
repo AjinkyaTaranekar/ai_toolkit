@@ -99,4 +99,3 @@ GRANT EXECUTE ON FUNCTION ai_toolkit.explain_query(text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.explain_error(text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.view_memories() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.search_memory(text) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION ai_toolkit.view_logs(integer) TO PUBLIC;
