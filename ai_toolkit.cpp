@@ -21,6 +21,11 @@ extern "C"
 #include "utils/guc.h"
 #include <executor/spi.h>
 #include <catalog/pg_type_d.h>
+#include <tcop/utility.h>
+#include <utils/elog.h>
+#include <nodes/parsenodes.h>
+#include <executor/executor.h>
+#include <tcop/tcopprot.h>
 
 #ifdef PG_MODULE_MAGIC
     PG_MODULE_MAGIC;
@@ -31,6 +36,15 @@ extern "C"
     static char *openrouter_model = nullptr;
     static char *openrouter_base_url = nullptr;
     static char *prompt_file_path = nullptr;
+
+    // Session-level tracking for queries and errors
+    static std::string last_query_text;
+    static std::string last_error_text;
+
+    // Hook variables
+    static ExecutorStart_hook_type prev_ExecutorStart = nullptr;
+    static emit_log_hook_type prev_emit_log_hook = nullptr;
+    static ProcessUtility_hook_type prev_ProcessUtility = nullptr;
 
     /**
      * Core function to set memory in database
@@ -625,6 +639,8 @@ extern "C"
     PG_FUNCTION_INFO_V1(set_memory);
     PG_FUNCTION_INFO_V1(get_memory);
     PG_FUNCTION_INFO_V1(query);
+    PG_FUNCTION_INFO_V1(explain_query);
+    PG_FUNCTION_INFO_V1(explain_error);
 
     /**
      * Help function - provides toolkit documentation
@@ -643,6 +659,18 @@ extern "C"
             "      ⚠️  DDL/DML queries are generated with disclaimers and NOT executed\n"
             "      Example: SELECT ai_toolkit.query('show active users');\n"
             "      Example: SELECT ai_toolkit.query('create a users table');\n\n"
+            "  • ai_toolkit.explain_query([text])  \n"
+            "      Get AI-powered explanation of a SQL query (returns void, shows via NOTICE)\n"
+            "      If no query provided, explains the last executed query in session\n"
+            "      🔄 Auto-tracks ALL queries from any source (CLI, apps, tools)\n"
+            "      Example: SELECT ai_toolkit.explain_query('SELECT * FROM users');\n"
+            "      Example: SELECT * FROM orders; -- then: SELECT ai_toolkit.explain_query();\n\n"
+            "  • ai_toolkit.explain_error([text])  \n"
+            "      Get AI-powered explanation and solution for an error (returns void, shows via NOTICE)\n"
+            "      If no error provided, explains the last error in session\n"
+            "      🔄 Auto-tracks ALL errors from any source\n"
+            "      Example: SELECT ai_toolkit.explain_error('syntax error at...');\n"
+            "      Example: After any error, call: SELECT ai_toolkit.explain_error();\n\n"
             "  • ai_toolkit.set_memory(category, key, value, notes)\n"
             "      Store contextual information about database schema\n"
             "      Example: SELECT ai_toolkit.set_memory(\n"
@@ -1022,6 +1050,9 @@ extern "C"
 
                 if (!sql_query.empty())
                 {
+                    // Store the query in session memory for explain_query function
+                    memory_set_core("session", "last_query", sql_query, "Last executed query in session", nullptr, false);
+
                     // Check if query is DDL or DML by examining the first keyword
                     std::string query_upper = sql_query;
                     std::transform(query_upper.begin(), query_upper.end(), query_upper.begin(), ::toupper);
@@ -1089,6 +1120,9 @@ extern "C"
 
                     if (ret < 0)
                     {
+                        std::string error_info = "Query execution failed with SPI error code: " + std::to_string(ret);
+                        memory_set_core("session", "last_error", error_info, "Last error in session", nullptr, false);
+
                         SPI_finish();
                         ereport(ERROR,
                                 (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
@@ -1182,10 +1216,476 @@ extern "C"
                      errmsg("Exception in query: %s", e.what())));
         }
     }
+
+    /**
+     * Explain Query function - AI-powered explanation of SQL queries
+     * Takes optional query text, or uses last executed query from session
+     */
+    Datum explain_query(PG_FUNCTION_ARGS)
+    {
+        try
+        {
+            if (!openrouter_api_key)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("ai_toolkit.openrouter_api_key not set")));
+            }
+
+            std::string query_to_explain;
+
+            // Check if query argument is provided
+            if (PG_ARGISNULL(0))
+            {
+                // No argument provided, use last query from session
+                if (last_query_text.empty())
+                {
+                    // Try to retrieve from memory table as fallback
+                    if (SPI_connect() != SPI_OK_CONNECT)
+                    {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                                 errmsg("Failed to connect to SPI")));
+                    }
+
+                    std::string error_msg;
+                    auto last_query = memory_get_core("session", "last_query", &error_msg, false);
+
+                    if (!last_query.has_value())
+                    {
+                        SPI_finish();
+                        ereport(ERROR,
+                                (errcode(ERRCODE_NO_DATA),
+                                 errmsg("No query to explain. Either provide a query or execute a query first.")));
+                    }
+
+                    query_to_explain = last_query.value();
+                    SPI_finish();
+                }
+                else
+                {
+                    query_to_explain = last_query_text;
+                }
+
+                if (SPI_connect() != SPI_OK_CONNECT)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("Failed to connect to SPI")));
+                }
+            }
+            else
+            {
+                // Use provided query
+                text *query_text = PG_GETARG_TEXT_PP(0);
+                query_to_explain = std::string(VARDATA_ANY(query_text), VARSIZE_ANY_EXHDR(query_text));
+
+                if (SPI_connect() != SPI_OK_CONNECT)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("Failed to connect to SPI")));
+                }
+            }
+
+            std::string api_key(openrouter_api_key);
+            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
+            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
+
+            // Create AI client
+            auto client = ai::openai::create_client(api_key, base_url);
+
+            // Define tools
+            ai::Tool get_memory_tool = ai::create_simple_tool(
+                "get_memory",
+                "Retrieve previously stored information about database schema, tables, columns, relationships, or business rules. "
+                "Parameters: category (table|column|relationship|business_rule|data_pattern|calculation|permission|custom), "
+                "key (identifier like table name or 'table.column')",
+                {{"category", "string"}, {"key", "string"}},
+                tool_get_memory);
+
+            ai::Tool list_schemas_tool = ai::create_simple_tool(
+                "list_schemas",
+                "List all available schemas in the current PostgreSQL database. No parameters required.",
+                {},
+                tool_list_schemas);
+
+            ai::Tool list_tables_tool = ai::create_simple_tool(
+                "list_tables_in_schema",
+                "List all tables in a specific schema. Parameters: schema (name of the schema)",
+                {{"schema", "string"}},
+                tool_list_tables_in_schema);
+
+            ai::Tool get_schema_tool = ai::create_simple_tool(
+                "get_schema_for_table",
+                "Get the CREATE TABLE statement (schema) for a specific table. "
+                "Parameters: table_name (name of table, optionally prefixed with schema like 'schema.table')",
+                {{"table_name", "string"}},
+                tool_get_schema_for_table);
+
+            // Build explanation prompt
+            std::string system_prompt =
+                "You are a PostgreSQL database expert. Your role is to explain SQL queries in detail.\n\n"
+                "When explaining a query:\n"
+                "1. Use available tools to understand the database schema\n"
+                "2. Break down the query into logical components\n"
+                "3. Explain what each part does\n"
+                "4. Identify potential issues or optimization opportunities\n"
+                "5. Use get_memory to check for stored context about tables/columns\n\n"
+                "Provide your explanation in clear, structured format with:\n"
+                "- Query purpose/goal\n"
+                "- Step-by-step breakdown\n"
+                "- Performance considerations\n"
+                "- Any recommendations\n";
+
+            std::string user_prompt = "Explain this SQL query in detail:\n\n" + query_to_explain;
+
+            // Configure generation options
+            ai::GenerateOptions options(model, system_prompt, user_prompt);
+            options.tools["get_memory"] = get_memory_tool;
+            options.tools["list_schemas"] = list_schemas_tool;
+            options.tools["list_tables_in_schema"] = list_tables_tool;
+            options.tools["get_schema_for_table"] = get_schema_tool;
+            options.max_steps = 8;
+
+            // Generate explanation
+            auto result = client.generate_text(options);
+
+            SPI_finish();
+
+            if (result)
+            {
+                std::string explanation = "\n📖 Query Explanation\n"
+                                          "═══════════════════════════════════════════════════════════\n"
+                                          "Query:\n" +
+                                          query_to_explain + "\n\n"
+                                                             "Explanation:\n" +
+                                          result.text + "\n"
+                                                        "═══════════════════════════════════════════════════════════\n";
+
+                elog(NOTICE, "%s", explanation.c_str());
+                PG_RETURN_VOID();
+            }
+            else
+            {
+                std::string error_msg = "Failed to generate explanation: " + result.error_message();
+                ereport(ERROR,
+                        (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                         errmsg("%s", error_msg.c_str())));
+            }
+        }
+        catch (const std::exception &e)
+        {
+            SPI_finish();
+            ereport(ERROR,
+                    (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                     errmsg("Exception in explain_query: %s", e.what())));
+        }
+    }
+
+    /**
+     * Explain Error function - AI-powered explanation of SQL errors
+     * Takes optional error text, or uses last error from session
+     */
+    Datum explain_error(PG_FUNCTION_ARGS)
+    {
+        try
+        {
+            if (!openrouter_api_key)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("ai_toolkit.openrouter_api_key not set")));
+            }
+
+            std::string error_to_explain;
+
+            // Check if error argument is provided
+            if (PG_ARGISNULL(0))
+            {
+                // No argument provided, use last error from session
+                if (last_error_text.empty())
+                {
+                    // Try to retrieve from memory table as fallback
+                    if (SPI_connect() != SPI_OK_CONNECT)
+                    {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                                 errmsg("Failed to connect to SPI")));
+                    }
+
+                    std::string error_msg;
+                    auto last_error = memory_get_core("session", "last_error", &error_msg, false);
+
+                    if (!last_error.has_value())
+                    {
+                        SPI_finish();
+                        ereport(ERROR,
+                                (errcode(ERRCODE_NO_DATA),
+                                 errmsg("No error to explain. Either provide an error message or encounter an error first.")));
+                    }
+
+                    error_to_explain = last_error.value();
+                    SPI_finish();
+                }
+                else
+                {
+                    error_to_explain = last_error_text;
+                }
+
+                if (SPI_connect() != SPI_OK_CONNECT)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("Failed to connect to SPI")));
+                }
+            }
+            else
+            {
+                // Use provided error
+                text *error_text = PG_GETARG_TEXT_PP(0);
+                error_to_explain = std::string(VARDATA_ANY(error_text), VARSIZE_ANY_EXHDR(error_text));
+
+                if (SPI_connect() != SPI_OK_CONNECT)
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("Failed to connect to SPI")));
+                }
+            }
+
+            std::string api_key(openrouter_api_key);
+            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
+            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
+
+            // Create AI client
+            auto client = ai::openai::create_client(api_key, base_url);
+
+            // Define tools
+            ai::Tool get_memory_tool = ai::create_simple_tool(
+                "get_memory",
+                "Retrieve previously stored information about database schema, tables, columns, relationships, or business rules. "
+                "Parameters: category (table|column|relationship|business_rule|data_pattern|calculation|permission|custom), "
+                "key (identifier like table name or 'table.column')",
+                {{"category", "string"}, {"key", "string"}},
+                tool_get_memory);
+
+            ai::Tool list_schemas_tool = ai::create_simple_tool(
+                "list_schemas",
+                "List all available schemas in the current PostgreSQL database. No parameters required.",
+                {},
+                tool_list_schemas);
+
+            ai::Tool list_tables_tool = ai::create_simple_tool(
+                "list_tables_in_schema",
+                "List all tables in a specific schema. Parameters: schema (name of the schema)",
+                {{"schema", "string"}},
+                tool_list_tables_in_schema);
+
+            ai::Tool get_schema_tool = ai::create_simple_tool(
+                "get_schema_for_table",
+                "Get the CREATE TABLE statement (schema) for a specific table. "
+                "Parameters: table_name (name of table, optionally prefixed with schema like 'schema.table')",
+                {{"table_name", "string"}},
+                tool_get_schema_for_table);
+
+            // Build explanation prompt
+            std::string system_prompt =
+                "You are a PostgreSQL database expert specializing in debugging and error resolution.\n\n"
+                "When explaining an error:\n"
+                "1. Identify the error type and root cause\n"
+                "2. Use available tools to understand the database context if needed\n"
+                "3. Explain what went wrong in simple terms\n"
+                "4. Provide step-by-step solutions\n"
+                "5. Suggest best practices to avoid similar errors\n\n"
+                "Provide your explanation in clear, structured format with:\n"
+                "- Error type and cause\n"
+                "- Why it happened\n"
+                "- How to fix it (with examples if applicable)\n"
+                "- Prevention tips\n";
+
+            std::string user_prompt = "Explain this PostgreSQL error and provide solutions:\n\n" + error_to_explain;
+
+            // Configure generation options
+            ai::GenerateOptions options(model, system_prompt, user_prompt);
+            options.tools["get_memory"] = get_memory_tool;
+            options.tools["list_schemas"] = list_schemas_tool;
+            options.tools["list_tables_in_schema"] = list_tables_tool;
+            options.tools["get_schema_for_table"] = get_schema_tool;
+            options.max_steps = 8;
+
+            // Generate explanation
+            auto result = client.generate_text(options);
+
+            SPI_finish();
+
+            if (result)
+            {
+                std::string explanation = "\n🔧 Error Explanation\n"
+                                          "═══════════════════════════════════════════════════════════\n"
+                                          "Error:\n" +
+                                          error_to_explain + "\n\n"
+                                                             "Analysis & Solution:\n" +
+                                          result.text + "\n"
+                                                        "═══════════════════════════════════════════════════════════\n";
+
+                elog(NOTICE, "%s", explanation.c_str());
+                PG_RETURN_VOID();
+            }
+            else
+            {
+                std::string error_msg = "Failed to generate explanation: " + result.error_message();
+                ereport(ERROR,
+                        (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                         errmsg("%s", error_msg.c_str())));
+            }
+        }
+        catch (const std::exception &e)
+        {
+            SPI_finish();
+            ereport(ERROR,
+                    (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                     errmsg("Exception in explain_error: %s", e.what())));
+        }
+    }
 }
 
 extern "C"
 {
+    /**
+     * Hook to capture query execution
+     * This captures SELECT, INSERT, UPDATE, DELETE queries
+     */
+    static void ai_toolkit_ExecutorStart(QueryDesc *queryDesc, int eflags)
+    {
+        // Capture the query string if available
+        if (queryDesc && queryDesc->sourceText)
+        {
+            try
+            {
+                last_query_text = std::string(queryDesc->sourceText);
+
+                // Also store in memory table for persistence across connections
+                if (SPI_connect() == SPI_OK_CONNECT)
+                {
+                    memory_set_core("session", "last_query", last_query_text,
+                                    "Last executed query in session", nullptr, false);
+                    SPI_finish();
+                }
+            }
+            catch (...)
+            {
+                // Silently ignore errors in query tracking
+            }
+        }
+
+        // Call the previous hook if it exists
+        if (prev_ExecutorStart)
+            prev_ExecutorStart(queryDesc, eflags);
+        else
+            standard_ExecutorStart(queryDesc, eflags);
+    }
+
+    /**
+     * Hook to capture utility commands (DDL, etc.)
+     * This captures CREATE, ALTER, DROP, GRANT, etc.
+     */
+    static void ai_toolkit_ProcessUtility(PlannedStmt *pstmt,
+                                          const char *queryString,
+                                          bool readOnlyTree,
+                                          ProcessUtilityContext context,
+                                          ParamListInfo params,
+                                          QueryEnvironment *queryEnv,
+                                          DestReceiver *dest,
+                                          QueryCompletion *qc)
+    {
+        // Capture the query string
+        if (queryString)
+        {
+            try
+            {
+                last_query_text = std::string(queryString);
+
+                // Also store in memory table
+                if (SPI_connect() == SPI_OK_CONNECT)
+                {
+                    memory_set_core("session", "last_query", last_query_text,
+                                    "Last executed query in session", nullptr, false);
+                    SPI_finish();
+                }
+            }
+            catch (...)
+            {
+                // Silently ignore errors in query tracking
+            }
+        }
+
+        // Call the previous hook if it exists
+        if (prev_ProcessUtility)
+            prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                params, queryEnv, dest, qc);
+        else
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+                                    params, queryEnv, dest, qc);
+    }
+
+    /**
+     * Hook to capture error messages
+     * This captures all ERROR and FATAL log messages
+     */
+    static void ai_toolkit_emit_log(ErrorData *edata)
+    {
+        // Only capture ERROR and FATAL messages
+        if (edata && (edata->elevel == ERROR || edata->elevel == FATAL))
+        {
+            try
+            {
+                std::stringstream error_stream;
+
+                // Build comprehensive error message
+                if (edata->message)
+                {
+                    error_stream << "ERROR: " << edata->message;
+                }
+
+                if (edata->detail)
+                {
+                    error_stream << "\nDETAIL: " << edata->detail;
+                }
+
+                if (edata->hint)
+                {
+                    error_stream << "\nHINT: " << edata->hint;
+                }
+
+                if (edata->context)
+                {
+                    error_stream << "\nCONTEXT: " << edata->context;
+                }
+
+                // Add query context if available
+                if (!last_query_text.empty())
+                {
+                    error_stream << "\nQUERY: " << last_query_text;
+                }
+
+                last_error_text = error_stream.str();
+
+                // Store in memory table (attempt, but don't fail if it doesn't work)
+                // Note: We can't use SPI here as we're in an error context
+                // So we only store in the static variable
+            }
+            catch (...)
+            {
+                // Silently ignore errors in error tracking
+            }
+        }
+
+        // Call the previous hook if it exists
+        if (prev_emit_log_hook)
+            prev_emit_log_hook(edata);
+    }
+
     void _PG_init(void)
     {
         DefineCustomStringVariable("ai_toolkit.openrouter_api_key",
@@ -1234,11 +1734,26 @@ extern "C"
                                    nullptr,
                                    nullptr);
 
-        ereport(LOG, (errmsg("ai_toolkit extension loaded")));
+        // Install hooks to track all queries and errors in the session
+        prev_ExecutorStart = ExecutorStart_hook;
+        ExecutorStart_hook = ai_toolkit_ExecutorStart;
+
+        prev_ProcessUtility = ProcessUtility_hook;
+        ProcessUtility_hook = ai_toolkit_ProcessUtility;
+
+        prev_emit_log_hook = emit_log_hook;
+        emit_log_hook = ai_toolkit_emit_log;
+
+        ereport(LOG, (errmsg("ai_toolkit extension loaded with query/error tracking")));
     }
 
     void _PG_fini(void)
     {
+        // Restore previous hooks
+        ExecutorStart_hook = prev_ExecutorStart;
+        ProcessUtility_hook = prev_ProcessUtility;
+        emit_log_hook = prev_emit_log_hook;
+
         ereport(LOG, (errmsg("ai_toolkit extension unloaded")));
     }
 }

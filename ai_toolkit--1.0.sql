@@ -67,6 +67,16 @@ CREATE OR REPLACE FUNCTION ai_toolkit.query(text)
 RETURNS void AS 'ai_toolkit', 'query'
 LANGUAGE C STRICT;
 
+-- Explain query function - AI-powered explanation of SQL queries
+CREATE OR REPLACE FUNCTION ai_toolkit.explain_query(text DEFAULT NULL)
+RETURNS void AS 'ai_toolkit', 'explain_query'
+LANGUAGE C;
+
+-- Explain error function - AI-powered explanation of SQL errors
+CREATE OR REPLACE FUNCTION ai_toolkit.explain_error(text DEFAULT NULL)
+RETURNS void AS 'ai_toolkit', 'explain_error'
+LANGUAGE C;
+
 -- ==========================================
 -- Helper SQL Functions
 -- ==========================================
@@ -125,6 +135,8 @@ GRANT EXECUTE ON FUNCTION ai_toolkit.help() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.set_memory(text, text, text, text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.get_memory(text, text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.query(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai_toolkit.explain_query(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION ai_toolkit.explain_error(text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.view_memories() TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.search_memory(text) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION ai_toolkit.view_logs(integer) TO PUBLIC;
