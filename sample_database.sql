@@ -976,3 +976,86 @@ CREATE INDEX idx_payments_status ON payments.payments(payment_status);
 CREATE INDEX idx_payments_transaction ON payments.payments(transaction_id);
 CREATE INDEX idx_refunds_payment ON payments.refunds(payment_id);
 CREATE INDEX idx_refunds_order ON payments.refunds(order_id);
+
+-- =============================================
+-- AI TOOLKIT MEMORY SETUP
+-- =============================================
+
+SELECT ai_toolkit.set_memory('enum', 'users.user_addresses.address_type', 'shipping, billing, both', 
+    'Address can be used for shipping only, billing only, or both purposes');
+
+SELECT ai_toolkit.set_memory('enum', 'coupon.coupons.discount_type', 'percentage, fixed', 
+    'Percentage discount (e.g., 10% off) or fixed amount discount (e.g., $50 off)');
+
+SELECT ai_toolkit.set_memory('enum', 'orders.orders.order_status', 'pending, confirmed, processing, shipped, delivered, cancelled, refunded', 
+    'Order lifecycle: pending → confirmed → processing → shipped → delivered. Can be cancelled at any stage before shipped, or refunded after delivery');
+
+SELECT ai_toolkit.set_memory('enum', 'payments.payments.payment_method', 'credit_card, debit_card, upi, wallet, net_banking, cod', 
+    'Payment methods: credit_card, debit_card, upi (for Indian payments), wallet (internal wallet), net_banking, cod (cash on delivery)');
+
+SELECT ai_toolkit.set_memory('enum', 'payments.payments.payment_status', 'pending, completed, failed, refunded', 
+    'Payment status tracking the transaction state');
+
+SELECT ai_toolkit.set_memory('enum', 'payments.refunds.refund_status', 'pending, completed, rejected, failed', 
+    'Refund processing status');
+
+SELECT ai_toolkit.set_memory('enum', 'payments.refunds.refund_method', 'original_payment, wallet, bank_transfer', 
+    'Method used to return money: to original payment source, to user wallet, or via bank transfer');
+
+SELECT ai_toolkit.set_memory('enum', 'wallet.wallet_transactions.transaction_type', 'credit, debit', 
+    'Credit adds money to wallet, debit removes money from wallet');
+
+-- BUSINESS RULES: Important constraints and logic
+
+SELECT ai_toolkit.set_memory('business_rule', 'wallet_balance', 'Wallet balance must always be >= 0', 
+    'Enforced by CHECK constraint. Users cannot spend more than their wallet balance');
+
+SELECT ai_toolkit.set_memory('business_rule', 'coupon_usage_limit', 'Coupons have usage_limit and usage_count must not exceed it', 
+    'Check usage_count < usage_limit before applying coupon. WELCOME10 is limited to 1 use per customer');
+
+SELECT ai_toolkit.set_memory('business_rule', 'coupon_validity', 'Coupons are valid only between start_date and end_date when is_active=TRUE', 
+    'Check current timestamp is between start_date and end_date, and is_active=TRUE');
+
+SELECT ai_toolkit.set_memory('business_rule', 'coupon_minimum_purchase', 'Coupons require minimum purchase amount', 
+    'Order subtotal must be >= min_purchase_amount to apply coupon');
+
+SELECT ai_toolkit.set_memory('business_rule', 'order_total_calculation', 'Order total = subtotal - discount_amount + tax_amount + shipping_amount', 
+    'Tax is 8% of (subtotal - discount). Discount comes from applied coupon');
+
+SELECT ai_toolkit.set_memory('business_rule', 'default_address', 'Each user should have exactly one default address (is_default=TRUE)', 
+    'Used for shipping/billing when not explicitly specified');
+
+SELECT ai_toolkit.set_memory('business_rule', 'product_stock', 'stock_quantity must be checked before order confirmation', 
+    'Prevent overselling. Order quantity must be <= product stock_quantity');
+
+SELECT ai_toolkit.set_memory('business_rule', 'email_uniqueness', 'User email addresses must be unique across the system', 
+    'Enforced by UNIQUE constraint on users.users.email');
+
+SELECT ai_toolkit.set_memory('business_rule', 'order_cancellation', 'Orders can only be cancelled before they are shipped', 
+    'Check order_status is pending, confirmed, or processing before allowing cancellation');
+
+SELECT ai_toolkit.set_memory('business_rule', 'refund_eligibility', 'Full refunds only for delivered orders within 30 days', 
+    'Partial refunds possible for issues like late delivery. COD orders may have rejected refunds');
+
+-- RELATIONSHIPS: Key table relationships and foreign keys
+
+SELECT ai_toolkit.set_memory('relationship', 'products_categories', 'products.products belongs to products.categories via category_id', 
+    'Categories can have parent_category_id for hierarchies like Electronics > Audio');
+
+SELECT ai_toolkit.set_memory('relationship', 'cart_items', 'cart.cart_items links cart.cart to products.products', 
+    'Shopping cart has multiple items, each referencing a product with quantity');
+
+SELECT ai_toolkit.set_memory('relationship', 'orders_users', 'orders.orders belongs to users.users and references addresses and coupons', 
+    'Order has shipping_address_id, billing_address_id (from user_addresses), and optional coupon_id');
+
+SELECT ai_toolkit.set_memory('relationship', 'order_items', 'orders.order_items is the line items of an order', 
+    'Each order has multiple items with product_id, quantity, unit_price, total_price');
+
+SELECT ai_toolkit.set_memory('relationship', 'payments_orders', 'payments.payments linked to orders.orders via order_id', 
+    'Each order has one payment record. Refunds reference both payment_id and order_id');
+
+SELECT ai_toolkit.set_memory('relationship', 'wallets_users', 'wallet.wallets has 1:1 relationship with users.users', 
+    'Each user has exactly one wallet (UNIQUE constraint on user_id)');
+
+SELECT ai_toolkit.set_memory('relationship', 'wallet_transactions', 'wallet.wallet_transactions tracks all wallet activity', 
+    'Each transaction records type (credit/debit), amount, and balance_after for audit trail');
