@@ -2,6 +2,14 @@
 
 A PostgreSQL Extension that brings AI-powered Query Generation and Explanation Tools directly into your PostgreSQL database.
 
+## Features
+
+- 💬 Natural Language to SQL - Generate queries from plain English
+- 📖 Query Explanation - AI-powered SQL query explanations
+- 🔧 Error Resolution - Get solutions for SQL errors
+- 🧠 Contextual Memory - Store database context for better responses
+- 🤖 Multi-Provider Support - OpenAI, Anthropic, OpenRouter
+
 ## Available Functions
 
 Once installed, the extension provides the following functions:
@@ -117,17 +125,39 @@ Edit your PostgreSQL configuration file to add the required settings:
 sudo nano /etc/postgresql/18/main/postgresql.conf
 ```
 
-Add these lines at the end of the file:
+Add these lines at the end of the file (all fields are required):
 
 ```conf
-# AI Toolkit Configuration
-ai_toolkit.openrouter_api_key = 'sk-or-YOUR-API-KEY-HERE'
-ai_toolkit.openrouter_model = 'google/gemini-2.0-flash-exp:free'
-ai_toolkit.openrouter_base_url = 'https://openrouter.ai/api'
-ai_toolkit.prompt_file = '/path/to/your/system_prompt.txt'
+# AI Toolkit Configuration (Required)
+ai_toolkit.ai_provider = 'openai'                                        # Options: openai, anthropic, openrouter
+ai_toolkit.ai_api_key = 'sk-YOUR-API-KEY-HERE'                          # Your API key
+ai_toolkit.ai_model = 'gpt-4o'                                          # Model name
+ai_toolkit.prompt_file = '/usr/share/postgresql/18/extension/ai_toolkit/prompts/query_system_prompt.txt'
 ```
 
-**Important:** Replace `'sk-or-YOUR-API-KEY-HERE'` with your actual OpenRouter API key.
+**Examples by Provider:**
+
+```conf
+# OpenAI (GPT-4o)
+ai_toolkit.ai_provider = 'openai'
+ai_toolkit.ai_api_key = 'sk-YOUR-OPENAI-KEY'
+ai_toolkit.ai_model = 'gpt-5'
+ai_toolkit.prompt_file = '/usr/share/postgresql/18/extension/ai_toolkit/prompts/query_system_prompt.txt'
+
+# Anthropic (Claude Sonnet 4.5)
+ai_toolkit.ai_provider = 'anthropic'
+ai_toolkit.ai_api_key = 'sk-ant-YOUR-ANTHROPIC-KEY'
+ai_toolkit.ai_model = 'claude-sonnet-4-5'
+ai_toolkit.prompt_file = '/usr/share/postgresql/18/extension/ai_toolkit/prompts/query_system_prompt.txt'
+
+# OpenRouter (Free Models)
+ai_toolkit.ai_provider = 'openrouter'
+ai_toolkit.ai_api_key = 'sk-or-YOUR-OPENROUTER-KEY'
+ai_toolkit.ai_model = 'google/gemini-2.0-flash-exp:free'
+ai_toolkit.prompt_file = '/usr/share/postgresql/18/extension/ai_toolkit/prompts/query_system_prompt.txt'
+```
+
+**Note:** Replace the API key with your actual key. The `prompt_file` path should point to the system prompt file included with the extension.
 
 ### Step 4: Restart PostgreSQL
 
@@ -165,6 +195,22 @@ Check that the extension is installed correctly:
 
 ```sql
 SELECT * FROM pg_extension WHERE extname = 'ai_toolkit';
+```
+
+## Usage Examples
+
+```sql
+-- Generate SQL from natural language
+SELECT ai_toolkit.query('show all users who signed up last week');
+
+-- Explain a query
+SELECT ai_toolkit.explain_query('SELECT * FROM users WHERE created_at > NOW() - INTERVAL ''7 days''');
+
+-- Get help with errors
+SELECT ai_toolkit.explain_error('ERROR: relation "user" does not exist');
+
+-- Store context to improve AI responses
+SELECT ai_toolkit.set_memory('table', 'users', 'Contains customer account information');
 ```
 
 ## Development Workflow

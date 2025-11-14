@@ -11,6 +11,7 @@
 #include <ai/ai.h>
 #include <ai/logger.h>
 #include <ai/openai.h>
+#include <ai/anthropic.h>
 #include <ai/tools.h>
 
 extern "C"
@@ -28,9 +29,10 @@ extern "C"
 #endif
 
     // Global configuration variables
-    static char *openrouter_api_key = nullptr;
-    static char *openrouter_model = nullptr;
-    static char *openrouter_base_url = nullptr;
+    static char *ai_provider = nullptr; // openai, anthropic, openrouter
+    static char *ai_api_key = nullptr;  // API key for the selected provider
+    static char *ai_model = nullptr;    // Model name
+    static char *ai_base_url = nullptr; // Custom base URL (optional)
     static char *prompt_file_path = nullptr;
 
     /**
@@ -236,6 +238,107 @@ extern "C"
         {
             elog(WARNING, "[load_system_prompt] Exception while reading prompt file: %s, using default prompt", e.what());
             return default_prompt;
+        }
+    }
+
+    /**
+     * Build AI client based on GUC configuration
+     * Supports OpenAI, Anthropic, and OpenRouter providers
+     * Returns: Configured AI client
+     * Throws: std::runtime_error if configuration is invalid
+     */
+    ai::Client build_ai_client()
+    {
+        // Get provider
+        std::string provider = ai_provider && strlen(ai_provider) > 0
+                                   ? std::string(ai_provider)
+                                   : "openrouter";
+        std::transform(provider.begin(), provider.end(), provider.begin(), ::tolower);
+
+        // Get API key
+        if (!ai_api_key || strlen(ai_api_key) == 0)
+        {
+            throw std::runtime_error("API key not configured. Set ai_toolkit.ai_api_key");
+        }
+        std::string api_key(ai_api_key);
+
+        // Get base URL (optional)
+        std::string base_url = ai_base_url && strlen(ai_base_url) > 0
+                                   ? std::string(ai_base_url)
+                                   : "";
+
+        // Build client based on provider
+        if (provider == "openai")
+        {
+            if (base_url.empty())
+            {
+                elog(LOG, "[build_ai_client] Creating OpenAI client");
+                return ai::openai::create_client(api_key);
+            }
+            else
+            {
+                elog(LOG, "[build_ai_client] Creating OpenAI client with custom base URL: %s", base_url.c_str());
+                return ai::openai::create_client(api_key, base_url);
+            }
+        }
+        else if (provider == "anthropic")
+        {
+            if (base_url.empty())
+            {
+                elog(LOG, "[build_ai_client] Creating Anthropic client");
+                return ai::anthropic::create_client(api_key);
+            }
+            else
+            {
+                elog(LOG, "[build_ai_client] Creating Anthropic client with custom base URL: %s", base_url.c_str());
+                return ai::anthropic::create_client(api_key, base_url);
+            }
+        }
+        else if (provider == "openrouter")
+        {
+            // OpenRouter uses OpenAI-compatible API
+            if (base_url.empty())
+            {
+                base_url = "https://openrouter.ai/api";
+            }
+            elog(LOG, "[build_ai_client] Creating OpenRouter client with base URL: %s", base_url.c_str());
+            return ai::openai::create_client(api_key, base_url);
+        }
+        else
+        {
+            throw std::runtime_error("Invalid provider '" + provider + "'. Supported: openai, anthropic, openrouter");
+        }
+    }
+
+    /**
+     * Get the configured model name
+     * Returns: Model name based on configuration or provider defaults
+     */
+    std::string get_configured_model()
+    {
+        // Return configured model if set
+        if (ai_model && strlen(ai_model) > 0)
+        {
+            return std::string(ai_model);
+        }
+
+        // Return default based on provider
+        std::string provider = ai_provider && strlen(ai_provider) > 0
+                                   ? std::string(ai_provider)
+                                   : "openrouter";
+        std::transform(provider.begin(), provider.end(), provider.begin(), ::tolower);
+
+        if (provider == "openai")
+        {
+            return std::string(ai::openai::models::kDefaultModel);
+        }
+        else if (provider == "anthropic")
+        {
+            return std::string(ai::anthropic::models::kDefaultModel);
+        }
+        else
+        {
+            return "meta-llama/llama-3.2-3b-instruct:free";
         }
     }
 
@@ -670,8 +773,15 @@ extern "C"
             "  • ai_toolkit.search_memory(keyword)  - Search memories\n"
             "  • ai_toolkit.view_logs(limit)  - View query logs\n\n"
             "⚙️  CONFIGURATION:\n\n"
-            "  SET ai_toolkit.openrouter_api_key = 'your-key';\n"
-            "  SET ai_toolkit.openrouter_model = 'model-name';\n\n"
+            "  -- Choose your AI provider:\n"
+            "  SET ai_toolkit.ai_provider = 'openai';      -- or 'anthropic', 'openrouter'\n"
+            "  SET ai_toolkit.ai_api_key = 'your-key';\n"
+            "  SET ai_toolkit.ai_model = 'gpt-4o-mini';    -- model name for your provider\n"
+            "  SET ai_toolkit.ai_base_url = 'custom-url';  -- optional, for custom endpoints\n\n"
+            "  📌 Provider Examples:\n"
+            "     OpenAI:     gpt-4o, gpt-4o-mini, gpt-3.5-turbo\n"
+            "     Anthropic:  claude-sonnet-4-5, claude-haiku-3-5\n"
+            "     OpenRouter: meta-llama/llama-3.2-3b-instruct:free\n\n"
             "📖 MEMORY CATEGORIES:\n\n"
             "  table, column, relationship, business_rule, data_pattern,\n"
             "  calculation, permission, custom\n\n"
@@ -771,17 +881,7 @@ extern "C"
 
         try
         {
-            if (!openrouter_api_key)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("ai_toolkit.openrouter_api_key not set")));
-            }
-
             std::string user_prompt(VARDATA_ANY(prompt_text), VARSIZE_ANY_EXHDR(prompt_text));
-            std::string api_key(openrouter_api_key);
-            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
-            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
 
             // Connect to SPI for tool functions to use
             if (SPI_connect() != SPI_OK_CONNECT)
@@ -791,8 +891,22 @@ extern "C"
                          errmsg("Failed to connect to SPI")));
             }
 
-            // Create AI client
-            auto client = ai::openai::create_client(api_key, base_url);
+            // Build AI client based on configuration
+            ai::Client client;
+            std::string model;
+            try
+            {
+                client = build_ai_client();
+                model = get_configured_model();
+            }
+            catch (const std::exception &e)
+            {
+                SPI_finish();
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("Failed to build AI client: %s", e.what()),
+                         errhint("Configure using: SET ai_toolkit.ai_provider = 'openai|anthropic|openrouter'; SET ai_toolkit.ai_api_key = 'your-key';")));
+            }
 
             // Define tools for memory operations using helper functions
             ai::Tool set_memory_tool = ai::create_simple_tool(
@@ -1212,13 +1326,6 @@ extern "C"
     {
         try
         {
-            if (!openrouter_api_key)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("ai_toolkit.openrouter_api_key not set")));
-            }
-
             // Query parameter is now required
             if (PG_ARGISNULL(0))
             {
@@ -1238,12 +1345,21 @@ extern "C"
                          errmsg("Failed to connect to SPI")));
             }
 
-            std::string api_key(openrouter_api_key);
-            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
-            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
-
-            // Create AI client
-            auto client = ai::openai::create_client(api_key, base_url);
+            // Build AI client based on configuration
+            ai::Client client;
+            std::string model;
+            try
+            {
+                client = build_ai_client();
+                model = get_configured_model();
+            }
+            catch (const std::exception &e)
+            {
+                SPI_finish();
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("Failed to build AI client: %s", e.what())));
+            }
 
             // Define tools
             ai::Tool get_memory_tool = ai::create_simple_tool(
@@ -1341,13 +1457,6 @@ extern "C"
     {
         try
         {
-            if (!openrouter_api_key)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("ai_toolkit.openrouter_api_key not set")));
-            }
-
             // Error parameter is now required
             if (PG_ARGISNULL(0))
             {
@@ -1367,12 +1476,21 @@ extern "C"
                          errmsg("Failed to connect to SPI")));
             }
 
-            std::string api_key(openrouter_api_key);
-            std::string base_url = openrouter_base_url ? openrouter_base_url : "https://openrouter.ai/api";
-            std::string model = openrouter_model ? std::string(openrouter_model) : "meta-llama/llama-3.2-3b-instruct:free";
-
-            // Create AI client
-            auto client = ai::openai::create_client(api_key, base_url);
+            // Build AI client based on configuration
+            ai::Client client;
+            std::string model;
+            try
+            {
+                client = build_ai_client();
+                model = get_configured_model();
+            }
+            catch (const std::exception &e)
+            {
+                SPI_finish();
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("Failed to build AI client: %s", e.what())));
+            }
 
             // Define tools
             ai::Tool get_memory_tool = ai::create_simple_tool(
@@ -1467,10 +1585,21 @@ extern "C"
 {
     void _PG_init(void)
     {
-        DefineCustomStringVariable("ai_toolkit.openrouter_api_key",
-                                   "OpenRouter API Key",
-                                   "API key for OpenRouter service",
-                                   &openrouter_api_key,
+        DefineCustomStringVariable("ai_toolkit.ai_provider",
+                                   "AI Provider",
+                                   "AI provider to use: openai, anthropic, or openrouter",
+                                   &ai_provider,
+                                   "openrouter",
+                                   PGC_USERSET,
+                                   0,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr);
+
+        DefineCustomStringVariable("ai_toolkit.ai_api_key",
+                                   "AI API Key",
+                                   "API key for the selected AI provider",
+                                   &ai_api_key,
                                    nullptr,
                                    PGC_SUSET,
                                    0,
@@ -1478,22 +1607,25 @@ extern "C"
                                    nullptr,
                                    nullptr);
 
-        DefineCustomStringVariable("ai_toolkit.openrouter_model",
-                                   "OpenRouter Model",
-                                   "Model to use (default: meta-llama/llama-3.2-3b-instruct:free)",
-                                   &openrouter_model,
-                                   "meta-llama/llama-3.2-3b-instruct:free",
+        DefineCustomStringVariable("ai_toolkit.ai_model",
+                                   "AI Model",
+                                   "Model to use with the selected provider. "
+                                   "Examples: gpt-4o-mini (OpenAI), claude-haiku-3-5 (Anthropic), "
+                                   "meta-llama/llama-3.2-3b-instruct:free (OpenRouter)",
+                                   &ai_model,
+                                   nullptr,
                                    PGC_USERSET,
                                    0,
                                    nullptr,
                                    nullptr,
                                    nullptr);
 
-        DefineCustomStringVariable("ai_toolkit.openrouter_base_url",
-                                   "OpenRouter Base URL",
-                                   "Base URL for OpenRouter API",
-                                   &openrouter_base_url,
-                                   "https://openrouter.ai/api",
+        DefineCustomStringVariable("ai_toolkit.ai_base_url",
+                                   "AI Base URL",
+                                   "Custom base URL for the AI provider (optional). "
+                                   "Use this for custom endpoints or proxies.",
+                                   &ai_base_url,
+                                   nullptr,
                                    PGC_USERSET,
                                    0,
                                    nullptr,
