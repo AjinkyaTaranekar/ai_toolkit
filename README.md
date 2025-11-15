@@ -2,6 +2,10 @@
 
 A PostgreSQL Extension that brings AI-powered Query Generation and Explanation Tools directly into your PostgreSQL database.
 
+
+https://github.com/user-attachments/assets/3d81bf61-a5dc-4696-8633-54e56701ac39
+
+
 ## Features
 
 - 💬 Natural Language to SQL - Generate queries from plain English
