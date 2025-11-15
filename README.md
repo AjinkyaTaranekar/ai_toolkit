@@ -1,6 +1,6 @@
 # ai_toolkit
 
-A PostgreSQL Extension that brings AI-powered Query Generation and Explanation Tools directly into your PostgreSQL database.
+A Postgres Extension to bring AI-Powered Query Generation and Explanation Tools right inside your Postgres database using [Clickhouse AI SDK](https://github.com/ClickHouse/ai-sdk-cpp) Internally. 
 
 
 https://github.com/user-attachments/assets/3d81bf61-a5dc-4696-8633-54e56701ac39
